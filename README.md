@@ -115,13 +115,11 @@ Videos are rendered offscreen, with no window and no screen-recording permission
 4. The viewer keeps per-file state with checkpoints: a jump replays a few hundred commits at most.
 5. The side panel and the territory view are live trackers updated on every step. Full rescans (new view, new source, long jump) run on a background thread and catch up with the playhead when they land, so they never block a frame.
 
-## Prior art
+## How it compares
 
-linelapse stands on ideas from tools worth knowing:
-
-- [Gource](https://github.com/acaudwell/Gource) animates who touched which files, as a growing tree. linelapse shows the state of the code (age, origin) rather than activity, and lets you jump anywhere instead of playing forward.
-- [git-of-theseus](https://github.com/erikbern/git-of-theseus) and [Hercules](https://github.com/src-d/hercules) chart how code ages over time (cohorts, survival, burndown). The cohort timeline and the half-life come from them; linelapse makes them interactive and spatial.
-- [Git Truck](https://github.com/git-truck/git-truck) maps a repository's structure and authorship in the browser.
+- [Gource](https://github.com/acaudwell/Gource) animates who touched which files; linelapse shows the state of the code (age, origin) and jumps to any commit instead of playing forward.
+- [git-of-theseus](https://github.com/erikbern/git-of-theseus) plots code by the year it was added; the cohort timeline and the half-life come from it, made interactive and spatial here.
+- [Hercules](https://github.com/src-d/hercules) computes line burndown with rich per-developer analyses; linelapse indexes the same first-parent history of Linux in 32 s and lets you browse it.
 
 ## Known limits
 
