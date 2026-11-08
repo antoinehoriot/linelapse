@@ -13,6 +13,7 @@ mod build;
 mod check;
 mod engine;
 mod record;
+mod remote;
 mod story;
 mod tree;
 mod treemap;
@@ -52,15 +53,16 @@ fn main() {
             positional = Some(a.clone());
         }
     }
-    let repo = PathBuf::from(positional.unwrap_or_else(|| ".".into()));
+    let repo: String = positional.unwrap_or_else(|| ".".into());
     let rebuild = flag("--rebuild");
 
     if flag("--check") {
         let progress = build::Progress::default();
         let phase = Mutex::new(String::new());
-        let code = match app::load_or_build(&repo, rebuild, &progress, &phase)
-            .and_then(|mut d| check::run(&repo, &mut d))
-        {
+        let code = match app::load_or_build(&repo, rebuild, &progress, &phase).and_then(|mut d| {
+            let path = std::path::PathBuf::from(&d.meta.repo);
+            check::run(&path, &mut d)
+        }) {
             Ok(0) => {
                 println!("OK: 0 mismatches");
                 0
@@ -127,9 +129,11 @@ fn main() {
     };
     let title = format!(
         "linelapse · {}",
-        repo.canonicalize()
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        std::path::Path::new(&repo)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&repo))
+            .file_name()
+            .map(|n| n.to_string_lossy().trim_end_matches(".git").to_string())
             .unwrap_or_else(|| "repo".into())
     );
     Application::new().run(move |cx: &mut App| {

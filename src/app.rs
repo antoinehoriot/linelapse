@@ -1,6 +1,6 @@
 //! The window: indexing screen, then the zoomable age map, provenance panel and timeline.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,12 +35,14 @@ pub struct Data {
 }
 
 /// Load the cache for `repo`, building it first if missing or out of date.
+/// `repo` is a local path or a URL (cloned into the cache first, fetched on later runs).
 pub fn load_or_build(
-    repo: &Path,
+    repo: &str,
     rebuild: bool,
     progress: &Progress,
     phase: &Mutex<String>,
 ) -> Result<Data, String> {
+    let repo = &crate::remote::resolve(repo, &build::cache_base(), phase)?;
     let dir = build::cache_dir(repo);
     let head = build::head(repo)?;
     let fresh = !rebuild
@@ -168,7 +170,7 @@ pub struct Scrubber {
 }
 
 impl Scrubber {
-    pub fn new(repo: PathBuf, rebuild: bool, opts: Opts, cx: &mut Context<Self>) -> Self {
+    pub fn new(repo: String, rebuild: bool, opts: Opts, cx: &mut Context<Self>) -> Self {
         let progress = Arc::new(Progress::default());
         let phase = Arc::new(Mutex::new("Preparing".to_string()));
         let result: Pending = Arc::new(Mutex::new(None));

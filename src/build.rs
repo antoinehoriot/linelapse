@@ -83,8 +83,9 @@ pub fn head(repo: &Path) -> Result<String, String> {
     Ok(git_out(repo, &["rev-parse", "HEAD"])?.trim().to_string())
 }
 
-pub fn cache_dir(repo: &Path) -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
+/// `<user cache>/linelapse`: indexes and clones of remote repositories live here.
+pub fn cache_base() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
             let home = PathBuf::from(std::env::var_os("HOME")?);
@@ -94,7 +95,11 @@ pub fn cache_dir(repo: &Path) -> PathBuf {
                 home.join(".cache")
             })
         })
-        .unwrap_or_else(std::env::temp_dir);
+        .unwrap_or_else(std::env::temp_dir)
+        .join("linelapse")
+}
+
+pub fn cache_dir(repo: &Path) -> PathBuf {
     let canon = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let name = canon
         .file_name()
@@ -105,7 +110,7 @@ pub fn cache_dir(repo: &Path) -> PathBuf {
     for b in canon.to_string_lossy().bytes() {
         h = (h ^ b as u64).wrapping_mul(0x100000001b3);
     }
-    base.join("linelapse").join(format!("{name}-{h:016x}"))
+    cache_base().join(format!("{name}-{h:016x}"))
 }
 
 /// Undo git's C-style quoting of unusual paths ("a/caf\303\251" -> a/café).

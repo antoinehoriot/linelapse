@@ -11,16 +11,24 @@ On the Linux kernel (77,605 mainline commits, 2005 to 2026):
 | Playback | 120 fps, frame p95 < 10 ms, seek < 0.3 ms |
 | Accuracy | 0 mismatches over 97,316 files, checked against git at 4 commits |
 
+## Install
+
+```sh
+cargo install --git https://github.com/antoinehoriot/linelapse
+```
+
+Or download a binary from the Releases page (macOS arm64 and x86_64, Linux x86_64). Needs `git` on the PATH; `ffmpeg` only for MP4/GIF export.
+
 ## Usage
 
 ```sh
-cargo build --release
-./target/release/linelapse ~/code/my-repo                 # indexes on first run, then opens
-./target/release/linelapse . --at 0.3 --path src          # 30% into history, zoomed on src/
-./target/release/linelapse . --source netdev/net          # open on a source's territory
-./target/release/linelapse . --check                      # verify the index against git, no window
-./target/release/linelapse . --rebuild                    # rebuild the cache
-./target/release/linelapse . --bench                      # full playback, timings on stderr
+linelapse https://github.com/torvalds/linux   # clones into the cache, then opens
+linelapse ~/code/my-repo                 # indexes on first run, then opens
+linelapse . --at 0.3 --path src          # 30% into history, zoomed on src/
+linelapse . --source netdev/net          # open on a source's territory
+linelapse . --check                      # verify the index against git, no window
+linelapse . --rebuild                    # rebuild the cache
+linelapse . --bench                      # full playback, timings on stderr
 ```
 
 ### Record a video
@@ -39,7 +47,7 @@ Keys: space play/pause, ← → one commit (shift: 500), esc or backspace to go 
 - **Click a marker** on the timeline to jump to that moment (the commits that changed the most lines).
 - **Click a source** in the side panel to see its territory: tiles keep the age colour of that source's own lines and fade where it owns less. Its commits light up on the timeline.
 
-The cache lives in `~/Library/Caches/linelapse/` (macOS) or `~/.cache/linelapse/`, and is rebuilt when HEAD changes.
+The cache lives in `~/Library/Caches/linelapse/` (macOS) or `~/.cache/linelapse/`, and is rebuilt when HEAD changes. Remote repositories are bare-cloned under `repos/` there and fetched on later runs.
 
 ## How it works
 
