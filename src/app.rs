@@ -181,6 +181,7 @@ pub struct Opts {
     pub start_path: Option<String>,
     /// Open on this source's territory (exact name from the provenance panel).
     pub source: Option<String>,
+    pub mode: ColorMode,
 }
 
 pub struct Scrubber {
@@ -251,7 +252,7 @@ impl Scrubber {
                     prov: Vec::new(),
                     prov_stale: true,
                     focus: None,
-                    mode: ColorMode::Age,
+                    mode: self.opts.mode,
                     focus_ticks: Vec::new(),
                     timeline_paths: None,
                     tx,

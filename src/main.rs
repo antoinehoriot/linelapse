@@ -137,6 +137,10 @@ fn main() {
         at: value("--at").and_then(|v| v.parse().ok()),
         start_path: value("--path"),
         source: value("--source"),
+        mode: match value("--color").as_deref() {
+            Some("language") | Some("lang") => app::ColorMode::Language,
+            _ => app::ColorMode::Age,
+        },
     };
     let title = format!(
         "linelapse · {}",
