@@ -74,12 +74,12 @@ impl Key {
     ) {
         match self {
             Key::Provenance { lo, hi } => {
-                for r in ev.births_of(c).chunks_exact(2) {
+                for r in ev.births_of(c).as_chunks::<2>().0 {
                     if (lo..hi).contains(&r[0]) {
                         data[src_of[c] as usize] += sign * r[1] as i64;
                     }
                 }
-                for r in ev.deaths_of(c).chunks_exact(3) {
+                for r in ev.deaths_of(c).as_chunks::<3>().0 {
                     if (lo..hi).contains(&r[0]) {
                         data[src_of[r[1] as usize] as usize] -= sign * r[2] as i64;
                     }
@@ -88,13 +88,13 @@ impl Key {
             Key::Territory { src } => {
                 let nf = data.len() / 2;
                 if src_of[c] == src {
-                    for r in ev.births_of(c).chunks_exact(2) {
+                    for r in ev.births_of(c).as_chunks::<2>().0 {
                         let (f, k) = (r[0] as usize, sign * r[1] as i64);
                         data[f] += k;
                         data[nf + f] += k * rel[c];
                     }
                 }
-                for r in ev.deaths_of(c).chunks_exact(3) {
+                for r in ev.deaths_of(c).as_chunks::<3>().0 {
                     let bc = r[1] as usize;
                     if src_of[bc] == src {
                         let (f, k) = (r[0] as usize, sign * r[2] as i64);
@@ -120,12 +120,12 @@ fn half_life_days<B: AsRef<[u8]>>(ev: &Events<B>, rel: &[i64], lo: u32, hi: u32)
     let mut died = vec![0i64; span]; // deaths by lifetime in days
     let mut dead_from = vec![0i64; n]; // deaths by birth commit
     for c in 0..n {
-        for r in ev.births_of(c).chunks_exact(2) {
+        for r in ev.births_of(c).as_chunks::<2>().0 {
             if (lo..hi).contains(&r[0]) {
                 born[c] += r[1] as i64;
             }
         }
-        for r in ev.deaths_of(c).chunks_exact(3) {
+        for r in ev.deaths_of(c).as_chunks::<3>().0 {
             if (lo..hi).contains(&r[0]) {
                 let bc = r[1] as usize;
                 died[days(rel[c] - rel[bc]).min(span - 1)] += r[2] as i64;
@@ -369,10 +369,10 @@ impl<B: AsRef<[u8]>> Engine<B> {
         let mut row = vec![0i64; ny];
         self.cohorts = Vec::with_capacity(n.div_ceil(self.cohort_step) * ny);
         for c in 0..n {
-            for r in self.ev.births_of(c).chunks_exact(2) {
+            for r in self.ev.births_of(c).as_chunks::<2>().0 {
                 row[year[c]] += r[1] as i64;
             }
-            for r in self.ev.deaths_of(c).chunks_exact(3) {
+            for r in self.ev.deaths_of(c).as_chunks::<3>().0 {
                 row[year[r[1] as usize]] -= r[2] as i64;
             }
             if c % self.cohort_step == 0 {
@@ -398,13 +398,13 @@ impl<B: AsRef<[u8]>> Engine<B> {
         let ev = Arc::clone(&self.ev);
         let t = self.rel(c);
         let (mut born, mut dead) = (0u64, 0u64);
-        for r in ev.births_of(c).chunks_exact(2) {
+        for r in ev.births_of(c).as_chunks::<2>().0 {
             let (f, k) = (r[0] as usize, r[1] as i64);
             self.state.count[f] += sign * k;
             self.state.sum[f] += sign * k * t;
             born += k as u64;
         }
-        for r in ev.deaths_of(c).chunks_exact(3) {
+        for r in ev.deaths_of(c).as_chunks::<3>().0 {
             let (f, bc, k) = (r[0] as usize, r[1] as usize, r[2] as i64);
             self.state.count[f] -= sign * k;
             self.state.sum[f] -= sign * k * self.rel(bc);
