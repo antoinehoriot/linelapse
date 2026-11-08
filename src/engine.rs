@@ -444,6 +444,11 @@ impl<B: AsRef<[u8]>> Engine<B> {
         }
     }
 
+    /// Live line count of every file at the current commit.
+    pub fn file_counts(&self) -> &[i64] {
+        &self.state.count
+    }
+
     /// Aggregate over the contiguous file id range `lo..hi` at the current commit.
     pub fn agg(&self, lo: usize, hi: usize) -> Agg {
         Agg {

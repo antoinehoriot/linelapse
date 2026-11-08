@@ -31,6 +31,7 @@ pub struct RecordOpts {
     pub from: f64,
     pub view: usize,
     pub focus: Option<u32>,
+    pub mode: crate::app::ColorMode,
     /// Half-life of the view, computed once before recording.
     pub half_life: Option<Option<f64>>,
 }
@@ -132,7 +133,7 @@ fn draw_frame(cv: &mut Canvas, data: &Data, o: &RecordOpts, vw: f32, vh: f32) {
 
     // Map.
     let map = map_rect(vw, vh);
-    let tiles = layout_tiles(data, o.view, o.focus, map);
+    let tiles = layout_tiles(data, o.view, o.focus, o.mode, map);
     for t in &tiles {
         cv.rect(t.rect, t.color, 1.0);
     }
@@ -205,40 +206,10 @@ fn draw_frame(cv: &mut Canvas, data: &Data, o: &RecordOpts, vw: f32, vh: f32) {
         hex(0x18181c),
         1.0,
     );
-    let title = match o.focus {
-        Some(f) => format!("Lines from {}: their mean age", data.src_names[f as usize]),
-        None => "Mean age of lines".to_string(),
-    };
-    cv.text(
-        &title,
-        px0 + 12.0,
-        HEADER_H + 12.0,
-        11.0,
-        hex(0xa1a1aa),
-        PANEL_W - 24.0,
-    );
-    let lw = PANEL_W - 24.0;
-    for i in 0..lw as usize {
-        let col = age_color(20.0 * i as f64 / lw as f64);
-        cv.rect(
-            Rect {
-                x: px0 + 12.0 + i as f32,
-                y: HEADER_H + 30.0,
-                w: 1.5,
-                h: 8.0,
-            },
-            col,
-            1.0,
-        );
-    }
-    for y in [0.0f32, 5.0, 10.0, 15.0, 20.0] {
-        let label = if y >= 20.0 {
-            "20 y+".to_string()
-        } else {
-            format!("{y:.0}")
-        };
-        let x = px0 + 12.0 + lw * y / 20.0 - if y > 0.0 { 14.0 } else { 0.0 };
-        cv.text(&label, x, HEADER_H + 42.0, 10.0, hex(0xa1a1aa), 40.0);
+    if o.mode == crate::app::ColorMode::Language {
+        draw_lang_legend(cv, data, node.lo as usize, node.hi as usize, px0);
+    } else {
+        draw_age_legend(cv, data, o, px0);
     }
     cv.text(
         &crate::app::half_life_text(o.half_life),
@@ -361,6 +332,86 @@ fn draw_frame(cv: &mut Canvas, data: &Data, o: &RecordOpts, vw: f32, vh: f32) {
                 40.0,
             );
         }
+    }
+}
+
+/// Age ramp with its title and year ticks, at the top of the side panel.
+fn draw_age_legend(cv: &mut Canvas, data: &Data, o: &RecordOpts, px0: f32) {
+    let title = match o.focus {
+        Some(f) => format!("Lines from {}: their mean age", data.src_names[f as usize]),
+        None => "Mean age of lines".to_string(),
+    };
+    cv.text(
+        &title,
+        px0 + 12.0,
+        HEADER_H + 12.0,
+        11.0,
+        hex(0xa1a1aa),
+        PANEL_W - 24.0,
+    );
+    let lw = PANEL_W - 24.0;
+    for i in 0..lw as usize {
+        let col = age_color(20.0 * i as f64 / lw as f64);
+        cv.rect(
+            Rect {
+                x: px0 + 12.0 + i as f32,
+                y: HEADER_H + 30.0,
+                w: 1.5,
+                h: 8.0,
+            },
+            col,
+            1.0,
+        );
+    }
+    for y in [0.0f32, 5.0, 10.0, 15.0, 20.0] {
+        let label = if y >= 20.0 {
+            "20 y+".to_string()
+        } else {
+            format!("{y:.0}")
+        };
+        let x = px0 + 12.0 + lw * y / 20.0 - if y > 0.0 { 14.0 } else { 0.0 };
+        cv.text(&label, x, HEADER_H + 42.0, 10.0, hex(0xa1a1aa), 40.0);
+    }
+}
+
+/// Dominant languages of the view with their share, in two columns of three, in the
+/// same space as the age ramp so the rest of the panel does not move.
+fn draw_lang_legend(cv: &mut Canvas, data: &Data, lo: usize, hi: usize, px0: f32) {
+    cv.text(
+        "Language with the most live lines",
+        px0 + 12.0,
+        HEADER_H + 12.0,
+        11.0,
+        hex(0xa1a1aa),
+        PANEL_W - 24.0,
+    );
+    let acc = crate::app::lang_counts(data, lo, hi);
+    let sum = acc.iter().sum::<i64>().max(1);
+    let mut ids: Vec<usize> = (0..acc.len()).filter(|&i| acc[i] > 0).collect();
+    ids.sort_by_key(|&i| std::cmp::Reverse(acc[i]));
+    for (k, i) in ids.into_iter().take(6).enumerate() {
+        let (name, col) = crate::lang::LANGS[i];
+        let x = px0 + 12.0 + (k / 3) as f32 * (PANEL_W - 24.0) / 2.0;
+        let y = HEADER_H + 26.0 + (k % 3) as f32 * 10.0;
+        cv.rect(
+            Rect {
+                x,
+                y: y + 1.0,
+                w: 7.0,
+                h: 7.0,
+            },
+            hex(col),
+            1.0,
+        );
+        let pct = 100.0 * acc[i] as f64 / sum as f64;
+        cv.text(
+            &format!("{name} {pct:.0}%"),
+            x + 10.0,
+            y - 1.0,
+            9.0,
+            hex(0xd4d4d8),
+            120.0,
+        );
     }
 }
 

@@ -4,6 +4,7 @@
 //!              [--source <name>]
 //!        linelapse [repo] --record <out.mp4|out.gif|dir/> [--size 1920x1080] [--fps 60]
 //!              [--seconds 20] [--at <0..1>] [--path <dir>] [--source <name>]
+//!              [--color age|language]
 //! Keys: space play/pause, left/right one commit (shift: 500), escape/backspace up.
 //! Click a directory to zoom in; click a marker on the timeline to jump to that moment;
 //! click a source in the provenance panel to see its territory.
@@ -12,6 +13,7 @@ mod app;
 mod build;
 mod check;
 mod engine;
+mod lang;
 mod record;
 mod remote;
 mod story;
@@ -45,6 +47,7 @@ fn main() {
             "--size",
             "--fps",
             "--seconds",
+            "--color",
         ]
         .contains(&a.as_str())
         {
@@ -111,6 +114,10 @@ fn main() {
                 from: value("--at").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                 view,
                 focus,
+                mode: match value("--color").as_deref() {
+                    Some("language") | Some("lang") => app::ColorMode::Language,
+                    _ => app::ColorMode::Age,
+                },
                 half_life: Some({
                     let node = &d.tree.nodes[view];
                     (d.engine.half_life_job(node.lo, node.hi))()

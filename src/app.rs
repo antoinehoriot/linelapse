@@ -32,6 +32,17 @@ pub struct Data {
     pub src_names: Vec<String>,
     pub src_of: Vec<u32>,
     pub moments: Vec<Moment>,
+    /// Language id of each file (see `lang::LANGS`).
+    pub lang_of: Vec<u8>,
+}
+
+/// What the map colour encodes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorMode {
+    /// Mean age of the live lines.
+    Age,
+    /// Language with the most live lines.
+    Language,
 }
 
 /// Load the cache for `repo`, building it first if missing or out of date.
@@ -90,7 +101,9 @@ pub fn load(dir: &Path) -> Result<Data, String> {
         src_names.len(),
         t0.elapsed().as_secs_f64()
     );
+    let lang_of = meta.files.iter().map(|f| crate::lang::lang_of(f)).collect();
     Ok(Data {
+        lang_of,
         meta,
         engine,
         tree,
@@ -144,6 +157,7 @@ struct Ready {
     prov_stale: bool,
     /// Selected source: the map shows its territory instead of line age.
     focus: Option<u32>,
+    mode: ColorMode,
     /// Commits of the selected source, for the timeline strip.
     focus_ticks: Vec<usize>,
     /// Cohort bands of the timeline, rebuilt only when its rect changes.
@@ -237,6 +251,7 @@ impl Scrubber {
                     prov: Vec::new(),
                     prov_stale: true,
                     focus: None,
+                    mode: ColorMode::Age,
                     focus_ticks: Vec::new(),
                     timeline_paths: None,
                     tx,
@@ -334,12 +349,9 @@ const FADED: u32 = 0x1d1d22;
 
 /// The selected source's lines keep their age colour; the rest of the tile fades out.
 /// Square root of the share so that a 5 % presence is still visible.
-fn territory_color(age_years: f64, share: f64) -> Hsla {
+fn territory_color(base: Hsla, share: f64) -> Hsla {
     let t = share.clamp(0.0, 1.0).sqrt() as f32;
-    let (a, b) = (
-        Hsla::from(gpui::rgb(FADED)).to_rgb(),
-        age_color(age_years).to_rgb(),
-    );
+    let (a, b) = (Hsla::from(gpui::rgb(FADED)).to_rgb(), base.to_rgb());
     Rgba {
         r: a.r + (b.r - a.r) * t,
         g: a.g + (b.g - a.g) * t,
@@ -349,21 +361,47 @@ fn territory_color(age_years: f64, share: f64) -> Hsla {
     .into()
 }
 
-/// Age colour, or the selected source's territory (grey while it computes).
+/// Live lines per language over files `lo..hi` at the current commit.
+pub(crate) fn lang_counts(data: &Data, lo: usize, hi: usize) -> [i64; crate::lang::LANGS.len()] {
+    let mut acc = [0i64; crate::lang::LANGS.len()];
+    let counts = data.engine.file_counts();
+    for f in lo..hi {
+        if counts[f] > 0 {
+            acc[data.lang_of[f] as usize] += counts[f];
+        }
+    }
+    acc
+}
+
+/// Colour of the language with the most live lines in `lo..hi`.
+fn lang_color(data: &Data, lo: usize, hi: usize) -> Hsla {
+    let acc = lang_counts(data, lo, hi);
+    let best = (0..acc.len()).max_by_key(|&i| acc[i]).unwrap_or(0);
+    rgba(crate::lang::LANGS[best].1)
+}
+
+/// Tile colour: age or language; with a selected source, that colour for the source's
+/// own lines, faded by its share of the tile (grey while the territory computes).
 fn tile_color(
-    e: &Engine<Mmap>,
+    data: &Data,
     focus: Option<u32>,
+    mode: ColorMode,
     lo: usize,
     hi: usize,
     a: crate::engine::Agg,
 ) -> Hsla {
-    match focus {
-        None => age_color(e.mean_age_years(a).unwrap_or(0.0)),
-        Some(_) => match e.territory(lo, hi) {
-            Some(mine) => territory_color(
-                e.mean_age_years(mine).unwrap_or(0.0),
-                mine.count as f64 / a.count.max(1) as f64,
-            ),
+    let e = &data.engine;
+    match (focus, mode) {
+        (None, ColorMode::Age) => age_color(e.mean_age_years(a).unwrap_or(0.0)),
+        (None, ColorMode::Language) => lang_color(data, lo, hi),
+        (Some(_), _) => match e.territory(lo, hi) {
+            Some(mine) => {
+                let base = match mode {
+                    ColorMode::Age => age_color(e.mean_age_years(mine).unwrap_or(0.0)),
+                    ColorMode::Language => lang_color(data, lo, hi),
+                };
+                territory_color(base, mine.count as f64 / a.count.max(1) as f64)
+            }
             None => rgba(0x3f3f46),
         },
     }
@@ -453,7 +491,13 @@ pub(crate) fn provenance_rows(
 
 /// Two-level treemap of `view`: its children, and inside each directory its own children.
 /// Shared by the window and the video recorder so both show exactly the same map.
-pub fn layout_tiles(data: &Data, view: usize, focus: Option<u32>, map: Rect) -> Vec<Tile> {
+pub fn layout_tiles(
+    data: &Data,
+    view: usize,
+    focus: Option<u32>,
+    mode: ColorMode,
+    map: Rect,
+) -> Vec<Tile> {
     let mut tiles = Vec::new();
     let (tree, e) = (&data.tree, &data.engine);
     let kids = &tree.nodes[view].children;
@@ -477,7 +521,7 @@ pub fn layout_tiles(data: &Data, view: usize, focus: Option<u32>, map: Rect) -> 
                 rect: inset(r, 0.5),
                 node: k,
                 frame: false,
-                color: tile_color(e, focus, node.lo as usize, node.hi as usize, a),
+                color: tile_color(data, focus, mode, node.lo as usize, node.hi as usize, a),
                 label: (r.w > 56.0 && r.h > 18.0).then(|| node.name.clone().into()),
             });
             continue;
@@ -521,7 +565,7 @@ pub fn layout_tiles(data: &Data, view: usize, focus: Option<u32>, map: Rect) -> 
                 rect: inset(q, 0.5),
                 node: gk[j],
                 frame: false,
-                color: tile_color(e, focus, g.lo as usize, g.hi as usize, a),
+                color: tile_color(data, focus, mode, g.lo as usize, g.hi as usize, a),
                 label: (q.w > 56.0 && q.h > 18.0).then(|| name.into()),
             });
         }
@@ -568,7 +612,7 @@ impl Ready {
     }
 
     fn build_tiles(&mut self, map: Rect) {
-        self.tiles = layout_tiles(&self.data, self.view, self.focus, map);
+        self.tiles = layout_tiles(&self.data, self.view, self.focus, self.mode, map);
     }
 
     fn hovered_tile(&self) -> Option<&Tile> {
@@ -1101,6 +1145,61 @@ impl Render for Scrubber {
         let stale = r.prov_stale;
         let legend_ticks = [0.0, 5.0, 10.0, 15.0, 20.0];
 
+        let lang_mode = r.mode == ColorMode::Language;
+        let legend = if lang_mode {
+            let acc = lang_counts(&r.data, view_node.lo as usize, view_node.hi as usize);
+            let sum = acc.iter().sum::<i64>().max(1);
+            let mut ids: Vec<usize> = (0..acc.len()).filter(|&i| acc[i] > 0).collect();
+            ids.sort_by_key(|&i| std::cmp::Reverse(acc[i]));
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .child("Language with the most live lines"),
+                )
+                .children(ids.into_iter().take(9).map(|i| {
+                    let (name, col) = crate::lang::LANGS[i];
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(11.0))
+                        .child(div().w(px(10.0)).h(px(10.0)).bg(rgba(col)))
+                        .child(div().flex_1().text_color(rgba(0xd4d4d8)).child(name))
+                        .child(format!("{:.1}%", 100.0 * acc[i] as f64 / sum as f64))
+                }))
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().text_size(px(11.0)).child(match sel {
+                    Some(f) => format!(
+                        "Lines from {}: their mean age",
+                        r.data.src_names[f as usize]
+                    ),
+                    None => "Mean age of lines".to_string(),
+                }))
+                .child(div().h(px(8.0)))
+                .child(div().relative().h(px(12.0)).text_size(px(10.0)).children(
+                    legend_ticks.iter().map(|&y| {
+                        div()
+                            .absolute()
+                            .left(px((PANEL_W - 24.0) * (y / 20.0) as f32
+                                - if y > 0.0 { 14.0 } else { 0.0 }))
+                            .child(if y >= 20.0 {
+                                "20 y+".to_string()
+                            } else {
+                                format!("{y:.0}")
+                            })
+                    }),
+                ))
+                .into_any_element()
+        };
         let el = div()
             .id("root")
             .track_focus(&focus)
@@ -1128,6 +1227,12 @@ impl Render for Scrubber {
                         r.playing = false;
                         r.pos = (r.data.engine.current() + step).min(n - 1) as f64;
                         r.seek(r.pos as usize);
+                    }
+                    "l" => {
+                        r.mode = match r.mode {
+                            ColorMode::Age => ColorMode::Language,
+                            ColorMode::Language => ColorMode::Age,
+                        };
                     }
                     "escape" | "backspace" => {
                         if r.focus.is_some() {
@@ -1207,7 +1312,10 @@ impl Render for Scrubber {
                             window.paint_quad(gpui::fill(bounds(Rect { x, y: tl.y, w: 1.0, h: tl.h }), rgba(TERRITORY).opacity(0.35)));
                         }
                         window.paint_quad(gpui::fill(bounds(Rect { x: head_x - 1.0, y: tl.y - 4.0, w: 2.0, h: tl.h + 8.0 }), rgba(0xfcf3a4)));
-                        // Age legend ramp.
+                        // Age legend ramp (the language legend is made of divs).
+                        if lang_mode {
+                            return;
+                        }
                         let lx = panel_x + 12.0;
                         let ly = HEADER_H + 30.0;
                         let lw = PANEL_W - 24.0;
@@ -1251,7 +1359,7 @@ impl Render for Scrubber {
                             .child(div().text_size(px(11.0)).text_color(rgba(0x71717a)).child(if r.fps > 0.0 {
                                 format!("{:.0} fps", r.fps)
                             } else {
-                                "space: play  ·  click: zoom  ·  esc: back".to_string()
+                                "space: play  ·  click: zoom  ·  l: languages  ·  esc: back".to_string()
                             })),
                     )
                     .child(
@@ -1279,19 +1387,7 @@ impl Render for Scrubber {
                     .flex_col()
                     .gap_2()
                     .text_color(rgba(0xa1a1aa))
-                    .child(div().text_size(px(11.0)).child(match sel {
-                        Some(f) => format!("Lines from {}: their mean age", r.data.src_names[f as usize]),
-                        None => "Mean age of lines".to_string(),
-                    }))
-                    .child(div().h(px(8.0)))
-                    .child(
-                        div().relative().h(px(12.0)).text_size(px(10.0)).children(legend_ticks.iter().map(|&y| {
-                            div()
-                                .absolute()
-                                .left(px((PANEL_W - 24.0) * (y / 20.0) as f32 - if y > 0.0 { 14.0 } else { 0.0 }))
-                                .child(if y >= 20.0 { "20 y+".to_string() } else { format!("{y:.0}") })
-                        })),
-                    )
+                    .child(legend)
                     .child(div().h(px(14.0)))
                     .child(
                         div()
