@@ -27,6 +27,7 @@
 - **The timeline.** Live lines stacked by the year they were written. Hover it to see how much of the code still dates from the first year.
 - **Key moments.** Markers on the commits that changed the most lines. Click one to jump there.
 - **Where code came from.** The side panel ranks the sources of the live lines in view: the maintainer tree named in each merge (`netdev/net-next`, `drm/drm`...), the merged branch, or the author of a direct commit. It updates live during playback.
+- **What changes with it.** Hover a tile: the panel lists the parts of the repo outside its parent that its commits also touch (at least 10% of them), with a strip showing when. On Linux, 48% of commits to `fs/ceph` also touch `net/ceph`. Partners on screen get an outline.
 - **A source's territory.** Click a source: tiles keep the age colour of that source's own lines and fade where it owns less. Its commits light up on the timeline.
 - **Half-life.** How long it took for half of the lines ever written in the current view to disappear (Kaplan-Meier, with lines still alive censored at HEAD). Linux: 11.3 years. `drivers/gpu`: 17.5 years.
 - **Languages.** Press `l` to colour tiles by the language with the most live lines.

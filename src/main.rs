@@ -12,6 +12,7 @@
 mod app;
 mod build;
 mod check;
+mod couple;
 mod engine;
 mod lang;
 mod record;

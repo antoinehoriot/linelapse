@@ -13,6 +13,7 @@ use gpui::{
 use memmap2::Mmap;
 
 use crate::build::{self, Meta, Progress};
+use crate::couple::{Bars, CoChange, Partners, Units};
 use crate::engine::{Done, Engine};
 use crate::story::{self, Moment};
 use crate::tree::Tree;
@@ -34,6 +35,8 @@ pub struct Data {
     pub moments: Vec<Moment>,
     /// Language id of each file (see `lang::LANGS`).
     pub lang_of: Vec<u8>,
+    /// Which files change in the same commits (hover panel).
+    pub cochange: CoChange,
 }
 
 /// What the map colour encodes.
@@ -102,7 +105,16 @@ pub fn load(dir: &Path) -> Result<Data, String> {
         t0.elapsed().as_secs_f64()
     );
     let lang_of = meta.files.iter().map(|f| crate::lang::lang_of(f)).collect();
+    let t1 = Instant::now();
+    let cochange = CoChange::build(engine.len(), meta.files.len(), |c, out| {
+        engine.touched(c, out)
+    });
+    eprintln!(
+        "co-change index built in {:.2}s",
+        t1.elapsed().as_secs_f64()
+    );
     Ok(Data {
+        cochange,
         lang_of,
         meta,
         engine,
@@ -171,6 +183,10 @@ struct Ready {
     half_life_pending: Option<usize>,
     hl_tx: Sender<(usize, Option<f64>)>,
     hl_rx: Receiver<(usize, Option<f64>)>,
+    /// Co-change units of one view (the last one hovered in), and partners per
+    /// (view, node), computed on first hover.
+    units: Option<(usize, Units)>,
+    partners: std::collections::HashMap<(usize, usize), Partners>,
     stats: Stats,
     fps: f64,
 }
@@ -261,6 +277,8 @@ impl Scrubber {
                     half_life_pending: None,
                     hl_tx,
                     hl_rx,
+                    units: None,
+                    partners: std::collections::HashMap::new(),
                     stats: Stats::default(),
                     fps: 0.0,
                 }))
@@ -490,6 +508,46 @@ pub(crate) fn provenance_rows(
     out
 }
 
+/// Co-change units for `view`, as (node, parent, lo, hi), covering the whole repository
+/// so partners outside the view are found too:
+/// - inside the view, the treemap's two levels (what is drawn, so partners get outlined);
+/// - outside it, each branch at the finest level that does not contain the view: the root
+///   map's two levels for the other top-level folders, then one level per ancestor (for
+///   `fs/ceph`: `net/ceph`, `drivers/block`..., then `fs/ext4`, `fs/nfs`...).
+///
+/// Taken from the tree, not from what is drawn, so the answer does not depend on tile
+/// sizes during playback.
+fn view_units(tree: &Tree, view: usize) -> Vec<(usize, usize, u32, u32)> {
+    let mut out = Vec::new();
+    let two_levels = |out: &mut Vec<(usize, usize, u32, u32)>, k: usize, parent: usize| {
+        let nk = &tree.nodes[k];
+        if nk.is_file || nk.children.is_empty() {
+            out.push((k, parent, nk.lo, nk.hi));
+        } else {
+            for &g in &nk.children {
+                out.push((g, k, tree.nodes[g].lo, tree.nodes[g].hi));
+            }
+        }
+    };
+    for &k in &tree.nodes[view].children {
+        two_levels(&mut out, k, view);
+    }
+    // Ancestors, from the view's parent up to the root: their other children.
+    let mut child = view;
+    while let Some(a) = tree.nodes[child].parent {
+        for &k in tree.nodes[a].children.iter().filter(|&&k| k != child) {
+            if a == 0 {
+                two_levels(&mut out, k, a);
+            } else {
+                let nk = &tree.nodes[k];
+                out.push((k, a, nk.lo, nk.hi));
+            }
+        }
+        child = a;
+    }
+    out
+}
+
 /// Two-level treemap of `view`: its children, and inside each directory its own children.
 /// Shared by the window and the video recorder so both show exactly the same map.
 pub fn layout_tiles(
@@ -619,6 +677,44 @@ impl Ready {
     fn hovered_tile(&self) -> Option<&Tile> {
         let (mx, my) = self.mouse?;
         self.tiles.iter().rev().find(|t| contains(t.rect, mx, my))
+    }
+
+    /// Co-change partners of the hovered tile (not a directory frame), computed on first
+    /// hover and cached per (view, node).
+    fn hovered_partners(&mut self) -> Option<(usize, &Partners)> {
+        let node = self.hovered_tile().filter(|t| !t.frame)?.node;
+        let key = (self.view, node);
+        if !self.partners.contains_key(&key) {
+            let t0 = Instant::now();
+            if self.units.as_ref().is_none_or(|(v, _)| *v != self.view) {
+                let list = view_units(&self.data.tree, self.view);
+                let units = self.data.cochange.units(self.data.meta.files.len(), &list);
+                self.units = Some((self.view, units));
+            }
+            let (_, units) = self.units.as_ref()?;
+            let u = units.nodes.iter().position(|&n| n == node)?;
+            let p = self.data.cochange.partners(units, u, Bars::PANEL);
+            let names: Vec<String> = p
+                .rows
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{} {:.0}%",
+                        self.data.tree.nodes[r.node].path,
+                        r.share * 100.0
+                    )
+                })
+                .collect();
+            eprintln!(
+                "co-change of {} in {:.1} ms: {} partners [{}]",
+                self.data.tree.nodes[node].path,
+                t0.elapsed().as_secs_f64() * 1e3,
+                p.rows.len(),
+                names.join(", ")
+            );
+            self.partners.insert(key, p);
+        }
+        self.partners.get(&key).map(|p| (node, p))
     }
 
     /// Zoom target for a click: the deepest directory under the cursor below the view.
@@ -861,6 +957,110 @@ fn loading_view(progress: &Progress, phase: &str) -> impl IntoElement {
         )
 }
 
+/// Panel section shown while a tile is hovered: the units its commits also touch, outside
+/// its own folder (see `couple`), each with a strip of shared commits over the history and
+/// the playhead `c` marked on it.
+fn cochange_section(data: &Data, node: usize, p: &Partners, c: usize) -> impl IntoElement {
+    let nd = &data.tree.nodes[node];
+    let parent = nd
+        .parent
+        .map_or(String::new(), |q| data.tree.nodes[q].path.clone());
+    let n = data.engine.len().max(2);
+    let w = PANEL_W - 32.0;
+    let head_x = w * c as f32 / (n - 1) as f32;
+    let rows = p.rows.iter().map(|row| {
+        let peak = row.bins.iter().copied().max().unwrap_or(1).max(1);
+        let bars = row.bins.iter().map(move |&k| {
+            let h = if k == 0 {
+                1.0
+            } else {
+                2.0 + 20.0 * k as f32 / peak as f32
+            };
+            div().flex_1().h(px(h)).bg(if k == 0 {
+                rgba(0x3f3f46)
+            } else {
+                rgba(TERRITORY)
+            })
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .px(px(4.0))
+            .py(px(2.0))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_size(px(11.0))
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_color(rgba(0xd4d4d8))
+                            .child(data.tree.nodes[row.node].path.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgba(0xa1a1aa))
+                            .child(format!("{:.0}%", row.share * 100.0)),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(3.0))
+                    .w(px(w * row.share as f32))
+                    .bg(rgba(0xa1a1aa)),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w(px(w))
+                    .h(px(22.0))
+                    .flex()
+                    .items_end()
+                    .gap(px(1.0))
+                    .children(bars)
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(head_x - 0.5))
+                            .top(px(0.0))
+                            .w(px(1.0))
+                            .h(px(22.0))
+                            .bg(rgba(0xfcf3a4)),
+                    ),
+            )
+    });
+    let note = if p.rows.is_empty() {
+        format!(
+            "No strong partner outside {parent}/ ({} commits).",
+            thousands(p.commits as i64)
+        )
+    } else {
+        format!(
+            "Share of its {} commits (2 to 40 files each) that also touch these, outside {parent}/.",
+            thousands(p.commits as i64)
+        )
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_size(px(11.0))
+                .child(format!("Also changed in commits to {}", nd.path)),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgba(0x71717a))
+                .child(note),
+        )
+        .children(rows)
+}
+
 impl Render for Scrubber {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.poll_loading();
@@ -910,6 +1110,8 @@ impl Render for Scrubber {
             window.request_animation_frame(); // poll the background rescan
         }
 
+        // Co-change partners of the hovered tile: outlined on the map, listed in the panel.
+        let cochange = r.hovered_partners().map(|(node, p)| (node, p.clone()));
         let c = r.data.engine.current();
         let tl = timeline_rect(vw, vh);
         let view_node = &r.data.tree.nodes[r.view];
@@ -977,6 +1179,12 @@ impl Render for Scrubber {
             .hovered_tile()
             .filter(|t| !t.frame)
             .map(|t| bounds(t.rect));
+        let partner_rects: Vec<Bounds<Pixels>> = cochange
+            .iter()
+            .flat_map(|(_, p)| &p.rows)
+            .filter_map(|row| r.tiles.iter().find(|t| !t.frame && t.node == row.node))
+            .map(|t| bounds(t.rect))
+            .collect();
         // Timeline: live lines stacked by the year they were born (oldest at the bottom).
         // One filled path per cohort, cached until the timeline is resized: 15k quads per
         // frame cost ~40 fps, 20-odd cached paths cost nothing. The part after the
@@ -1298,6 +1506,9 @@ impl Render for Scrubber {
                         if let Some(b) = hover_rect {
                             window.paint_quad(quad(b, px(0.), gpui::transparent_black(), px(1.5), rgba(0xffffff), Default::default()));
                         }
+                        for b in partner_rects {
+                            window.paint_quad(quad(b, px(0.), gpui::transparent_black(), px(1.5), rgba(TERRITORY), Default::default()));
+                        }
                         window.paint_quad(gpui::fill(bounds(tl), rgba(0x1c1c21)));
                         for (path, col) in stack {
                             window.paint_path(path, col);
@@ -1403,23 +1614,105 @@ impl Render for Scrubber {
                             .child("time until half the lines ever written here were gone (Kaplan-Meier, whole history)"),
                     )
                     .child(div().h(px(10.0)))
-                    .child(div().text_size(px(11.0)).child(if stale {
-                        "Where live lines came from (computing…)".to_string()
-                    } else {
-                        "Where live lines came from".to_string()
-                    }))
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgba(0x71717a))
-                            .child("The maintainer tree or author that brought them into the mainline. Click one to see its territory."),
-                    )
-                    .children(prov_rows),
+                    .child(match cochange {
+                        Some((node, p)) => cochange_section(&r.data, node, &p, c).into_any_element(),
+                        None => div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(div().text_size(px(11.0)).child(if stale {
+                                "Where live lines came from (computing…)".to_string()
+                            } else {
+                                "Where live lines came from".to_string()
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(rgba(0x71717a))
+                                    .child("The maintainer tree or author that brought them into the mainline. Click one to see its territory."),
+                            )
+                            .children(prov_rows)
+                            .into_any_element(),
+                    }),
             );
         let done = r.record_frame(t0.elapsed(), bench);
         if done {
             cx.quit();
         }
         el.into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Units cover every file exactly once, keep the map's two levels inside the view, and
+    /// reach outside it: zoomed on fs/ceph, net/ceph and fs/ext4 are units.
+    #[test]
+    fn view_units_cover_the_repo_from_any_view() {
+        let files: Vec<String> = [
+            "MAINTAINERS",
+            "drivers/block/rbd.c",
+            "drivers/gpu/a.c",
+            "fs/ceph/caps.c",
+            "fs/ceph/super.c",
+            "fs/ext4/inode.c",
+            "fs/namei.c",
+            "net/ceph/osd.c",
+            "net/core/dev.c",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let tree = Tree::new(&files);
+        let path = |u: &(usize, usize, u32, u32)| tree.nodes[u.0].path.clone();
+        for view in ["", "fs", "fs/ceph"] {
+            let v = if view.is_empty() {
+                0
+            } else {
+                tree.find(view).expect("view")
+            };
+            let units = view_units(&tree, v);
+            let mut covered = vec![0; files.len()];
+            for u in &units {
+                for f in u.2..u.3 {
+                    covered[f as usize] += 1;
+                }
+            }
+            assert!(covered.iter().all(|&k| k == 1), "{view}: {covered:?}");
+            let names: Vec<String> = units.iter().map(path).collect();
+            let want: &[&str] = match view {
+                "" => &[
+                    "MAINTAINERS",
+                    "drivers/block",
+                    "fs/ceph",
+                    "fs/ext4",
+                    "fs/namei.c",
+                    "net/ceph",
+                ],
+                "fs" => &[
+                    "fs/ceph/super.c",
+                    "fs/ext4/inode.c",
+                    "fs/namei.c",
+                    "net/ceph",
+                    "drivers/block",
+                ],
+                _ => &[
+                    "fs/ceph/caps.c",
+                    "fs/ceph/super.c",
+                    "fs/ext4",
+                    "fs/namei.c",
+                    "net/ceph",
+                    "MAINTAINERS",
+                ],
+            };
+            for w in want {
+                assert!(
+                    names.iter().any(|n| n == w),
+                    "{view}: {w} missing from {names:?}"
+                );
+            }
+        }
     }
 }

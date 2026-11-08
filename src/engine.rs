@@ -623,6 +623,19 @@ impl<B: AsRef<[u8]>> Engine<B> {
         move || half_life_days(&ev, &rel, lo, hi)
     }
 
+    /// Files that commit `c` touched (lines born, died, or carried by a rename, on either
+    /// side), sorted and deduplicated, into `out` (cleared first).
+    pub fn touched(&self, c: usize, out: &mut Vec<u32>) {
+        out.clear();
+        out.extend(self.ev.births_of(c).as_chunks::<2>().0.iter().map(|r| r[0]));
+        out.extend(self.ev.deaths_of(c).as_chunks::<3>().0.iter().map(|r| r[0]));
+        for r in self.ev.moves_of(c).as_chunks::<4>().0 {
+            out.extend([r[0], r[1]]);
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
+
     /// Live lines at the last commit, per birth commit, for each file in `files` (sorted
     /// pairs). One pass over every event; used by `--check` to compare with `git blame`.
     pub fn birth_histograms(&self, files: &[u32]) -> Vec<Vec<(u32, i64)>> {
