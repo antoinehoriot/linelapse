@@ -94,7 +94,7 @@ linelapse stands on ideas from tools worth knowing:
 - Lines are dated by when they reached the mainline (often a merge), not by their author's commit.
 - Renames are not followed (a rename is a deletion plus a creation). Binary files and submodules are ignored.
 - The cache is rebuilt from scratch when HEAD changes (not incremental yet).
-- The window is tested on macOS only. On Linux (arm64, in Docker via `scripts/docker-linux.sh`), the build, the test suite, `--check` and `--record` pass; the window itself has not been tried on a Linux desktop yet.
+- The window is tested on macOS only. On Linux (arm64 and x86_64, in Docker via `scripts/docker-linux.sh`), the build, the test suite, `--check` and `--record` pass; the window itself has not been tried on a Linux desktop yet.
 
 ## License
 
