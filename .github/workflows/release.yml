@@ -1,6 +1,10 @@
 # Build release binaries when a version tag is pushed (or by hand).
 # Standard runners are free for public repositories. If the repository ever goes private
 # again, drop the tag trigger: macOS minutes are billed there.
+# macOS uses the floating `macos-latest` label: the pinned `macos-14` image was retired
+# (v0.2.0's tag run failed with "The configuration 'macos-14-arm64-us-default' is not
+# supported" and its macOS archives were built locally). The x86_64 target is
+# cross-compiled on that arm64 runner.
 name: release
 
 on:
@@ -17,9 +21,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-14
+          - os: macos-latest
             target: x86_64-apple-darwin
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
