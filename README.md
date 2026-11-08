@@ -31,6 +31,13 @@
 - **Half-life.** How long it took for half of the lines ever written in the current view to disappear (Kaplan-Meier, with lines still alive censored at HEAD). Linux: 6.8 years. `drivers/gpu`: 14.6 years.
 - **Languages.** Press `l` to colour tiles by the language with the most live lines.
 
+### Modes
+
+| A source's territory | Languages | Zoom on a subsystem |
+|---|---|---|
+| ![Territory of davem/net-next](docs/territory.gif) | ![Colour by language](docs/languages.gif) | ![Zoom on drivers/gpu](docs/zoom.gif) |
+| `--source davem/net-next`: the networking tree owns `drivers/net` and `net/`; everything else fades. | `--color language` (or `l`): Devicetree takes over `arch/arm*`, Rust appears in `rust/`. | `--path drivers/gpu`: `amd/` grows fresh and yellow while `radeon/` turns violet. |
+
 ## Install
 
 ```sh
