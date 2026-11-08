@@ -40,11 +40,45 @@
 
 ## Install
 
+**Prebuilt binaries** for macOS (Apple Silicon, Intel) and Linux (x86_64, arm64) are on the [Releases page](https://github.com/antoinehoriot/linelapse/releases). Extract the archive and run `./linelapse`.
+
+- macOS: the binaries are not signed or notarized. If macOS blocks one, run `xattr -d com.apple.quarantine linelapse` once.
+- Linux: needs glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+) and the GPUI runtime libraries. Debian/Ubuntu: `sudo apt install libxkbcommon-x11-0 libwayland-client0 libx11-xcb1 libxcb1 libfontconfig1 libfreetype6 libvulkan1`.
+
+**With Cargo:**
+
 ```sh
 cargo install --git https://github.com/antoinehoriot/linelapse
 ```
 
-Needs `git` on the PATH, and `ffmpeg` only for MP4/GIF export. GPUI is built with its `runtime_shaders` feature, so the Xcode Metal Toolchain is not required. On Linux, install the GPUI system libraries first (Debian/Ubuntu: `libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev libvulkan-dev`).
+At runtime, `git` must be on the PATH; `ffmpeg` is only needed for MP4/GIF export.
+
+## Build from source
+
+Prerequisites:
+
+- Rust stable via [rustup](https://rustup.rs) (tested with 1.96 on macOS and 1.99 on Linux; the crate uses the 2024 edition).
+- `git`.
+- macOS: the Xcode Command Line Tools (`xcode-select --install`). The full Xcode Metal Toolchain is not needed: GPUI is built with its `runtime_shaders` feature.
+- Linux (Debian/Ubuntu): `sudo apt install build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev libvulkan-dev`.
+
+```sh
+git clone https://github.com/antoinehoriot/linelapse
+cd linelapse
+cargo build --release --locked
+./target/release/linelapse .            # open this repository's own history
+```
+
+The first build compiles GPUI and its dependencies (45 s from a fresh clone on a 14-core Mac; slower machines take longer). Later builds are incremental.
+
+For development:
+
+```sh
+cargo install cargo-nextest             # once
+scripts/check.sh                        # fmt, clippy -D warnings, full test suite
+scripts/docker-linux.sh                 # build + test + --check + --record on Linux, in Docker
+PLATFORM=linux/amd64 scripts/docker-linux.sh   # same on x86_64
+```
 
 ## Usage
 
