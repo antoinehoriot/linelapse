@@ -2967,7 +2967,7 @@ dependencies = [
 
 [[package]]
 name = "linelapse"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ab_glyph",
  "epaint_default_fonts",
