@@ -10,7 +10,14 @@
 //! - We shell out to `git log -p -U0` instead of using gitoxide's diff: git's output was
 //!   verified exact on the whole Linux history (0 mismatches over 97 316 files), and
 //!   splitting the history in ranges lets us run one git process per core.
-//! - Renames are not followed (`--no-renames`): a rename is a death plus a birth.
+//! - Renames are followed (`-M50% -l0`, set explicitly so the user's git config cannot
+//!   change the index): lines of a renamed file keep their birth commit and are recorded
+//!   as moves, not as a death plus a birth. On Linux 28% of all "deaths" were renames
+//!   (13.4 M of 47.7 M lines), which skewed ages, half-lives and per-author numbers.
+//!   `-l0` lifts git's 1000-file limit on inexact detection; the full Linux scan with it
+//!   costs about 2 s, and gave the same 35 284 renames as the default limit.
+//!   Copies (`-C`) are not followed: a copy duplicates lines, and which copy keeps the
+//!   original birth would be arbitrary.
 //! - Binary files and submodules produce no line events.
 //! - File ids are assigned in sorted path order, so every directory is a contiguous id
 //!   range; subtree queries become range checks.
@@ -22,7 +29,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommitMeta {
@@ -51,6 +58,8 @@ pub struct Progress {
 
 struct FilePatch {
     path: Box<str>,
+    /// Old path when git paired this file as a rename; hunks then apply to its lines.
+    from: Option<Box<str>>,
     /// (old_start, old_count, new_count) in git's 1-based hunk coordinates.
     hunks: Vec<(u32, u32, u32)>,
 }
@@ -165,6 +174,15 @@ fn header_path(line: &[u8]) -> Option<Box<str>> {
     Some(String::from_utf8_lossy(p).into())
 }
 
+/// Path from a `rename from x` / `rename to x` line (no a/ b/ prefix, maybe quoted).
+fn rename_path(line: &[u8], prefix: &[u8]) -> Option<Box<str>> {
+    let mut p = line.strip_prefix(prefix)?;
+    while let [rest @ .., b'\n' | b'\r'] = p {
+        p = rest;
+    }
+    Some(String::from_utf8_lossy(&unquote(p)).into())
+}
+
 fn parse_num(s: &[u8]) -> Option<u32> {
     std::str::from_utf8(s).ok()?.parse().ok()
 }
@@ -203,7 +221,8 @@ fn parse_range(
         "--reverse",
         "-p",
         "-U0",
-        "--no-renames",
+        "-M50%",
+        "-l0",
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
@@ -227,6 +246,7 @@ fn parse_range(
     let mut line = Vec::with_capacity(256);
     let mut rem: u32 = 0; // content lines left in the current hunk
     let mut minus: Option<Box<str>> = None;
+    let mut rename_from: Option<Box<str>> = None;
     let mut skip = false; // submodule entry
     let mut open = false; // current file already pushed
     loop {
@@ -260,6 +280,24 @@ fn parse_range(
             open = false;
             skip = false;
             minus = None;
+            rename_from = None;
+            continue;
+        }
+        // A rename opens the file entry by itself: a pure rename has no ---/+++ lines.
+        if !open && let Some(p) = rename_path(&line, b"rename from ") {
+            rename_from = Some(p);
+            continue;
+        }
+        if !open
+            && let Some(p) = rename_path(&line, b"rename to ")
+            && let (Some(from), Some(c)) = (rename_from.take(), commits.last_mut())
+        {
+            c.push(FilePatch {
+                path: p,
+                from: Some(from),
+                hunks: Vec::new(),
+            });
+            open = true;
             continue;
         }
         if line.starts_with(b"index ") && line.trim_ascii_end().ends_with(b" 160000")
@@ -278,6 +316,7 @@ fn parse_range(
             if let (Some(path), Some(c), false) = (path, commits.last_mut(), skip) {
                 c.push(FilePatch {
                     path,
+                    from: None,
                     hunks: Vec::new(),
                 });
                 open = true;
@@ -317,6 +356,9 @@ struct Out {
     birth_off: Vec<u32>,
     deaths: Vec<[u32; 3]>,
     death_off: Vec<u32>,
+    /// (from file, to file, birth commit, n): lines carried over by a rename.
+    moves: Vec<[u32; 4]>,
+    move_off: Vec<u32>,
 }
 
 pub fn build(repo: &Path, out_dir: &Path, progress: &Progress) -> Result<(), String> {
@@ -368,6 +410,8 @@ pub fn build(repo: &Path, out_dir: &Path, progress: &Progress) -> Result<(), Str
         birth_off: vec![0],
         deaths: Vec::new(),
         death_off: vec![0],
+        moves: Vec::new(),
+        move_off: vec![0],
     };
     let mut ci = 0usize;
 
@@ -393,6 +437,7 @@ pub fn build(repo: &Path, out_dir: &Path, progress: &Progress) -> Result<(), Str
                 ci += 1;
                 o.birth_off.push(o.births.len() as u32);
                 o.death_off.push(o.deaths.len() as u32);
+                o.move_off.push(o.moves.len() as u32);
                 progress.done.store(ci, Ordering::Relaxed);
             }
         }
@@ -418,6 +463,10 @@ pub fn build(repo: &Path, out_dir: &Path, progress: &Progress) -> Result<(), Str
     for d in &mut o.deaths {
         d[0] = remap[d[0] as usize];
     }
+    for m in &mut o.moves {
+        m[0] = remap[m[0] as usize];
+        m[1] = remap[m[1] as usize];
+    }
     let files: Vec<String> = order
         .iter()
         .map(|&i| paths[i as usize].to_string())
@@ -430,6 +479,8 @@ pub fn build(repo: &Path, out_dir: &Path, progress: &Progress) -> Result<(), Str
     write_u32s(&tmp.join("birth_off.u32"), &o.birth_off)?;
     write_u32s(&tmp.join("deaths.u32"), o.deaths.as_flattened())?;
     write_u32s(&tmp.join("death_off.u32"), &o.death_off)?;
+    write_u32s(&tmp.join("moves.u32"), o.moves.as_flattened())?;
+    write_u32s(&tmp.join("move_off.u32"), &o.move_off)?;
     let meta = Meta {
         format: FORMAT,
         repo: repo
@@ -448,6 +499,9 @@ pub fn build(repo: &Path, out_dir: &Path, progress: &Progress) -> Result<(), Str
     Ok(())
 }
 
+/// (old_start, old_count, new_count) per hunk, as in `FilePatch`.
+type Hunks = Vec<(u32, u32, u32)>;
+
 fn apply_commit(
     c: u32,
     files: Vec<FilePatch>,
@@ -456,8 +510,19 @@ fn apply_commit(
     state: &mut Vec<Vec<u32>>,
     o: &mut Out,
 ) {
+    // Take every rename source first: in one commit a path can be both a source and a
+    // destination (A -> B with B -> A, or A -> B with a new A).
+    let mut sources: Vec<(u32, Vec<u32>)> = Vec::new();
+    // (destination, rename source, hunks), applied after every source was taken.
+    let mut plan: Vec<(u32, Option<u32>, Hunks)> = Vec::new();
     for fp in files {
-        if fp.hunks.is_empty() {
+        // A source that never had lines (binary, empty, submodule) carries nothing: treat
+        // the destination as a plain file, so line-less paths still get no id.
+        let from = fp
+            .from
+            .and_then(|f| ids.get(&f).copied())
+            .filter(|&f| !state[f as usize].is_empty());
+        if from.is_none() && fp.hunks.is_empty() {
             continue;
         }
         let id = *ids.entry(fp.path.clone()).or_insert_with(|| {
@@ -465,34 +530,74 @@ fn apply_commit(
             state.push(Vec::new());
             (paths.len() - 1) as u32
         });
-        let cur = std::mem::take(&mut state[id as usize]);
+        if let Some(f) = from
+            && !sources.iter().any(|s| s.0 == f)
+        {
+            sources.push((f, std::mem::take(&mut state[f as usize])));
+        }
+        plan.push((id, from, fp.hunks));
+    }
+    for (id, from, hunks) in plan {
+        let cur = match from {
+            // A path can be the source of only one rename; a second claim gets nothing.
+            Some(f) => sources
+                .iter_mut()
+                .find(|s| s.0 == f)
+                .map(|s| std::mem::take(&mut s.1))
+                .unwrap_or_default(),
+            None => std::mem::take(&mut state[id as usize]),
+        };
+        // Lines removed by the hunks die in the file they lived in.
+        let dead_in = from.unwrap_or(id);
         let mut new = Vec::with_capacity(cur.len());
         let mut pos = 0usize;
         let mut born = 0u32;
-        for (a, b, d) in fp.hunks {
+        let keep = |new: &mut Vec<u32>, lines: &[u32], o: &mut Out| {
+            if let Some(f) = from.filter(|&f| f != id) {
+                let first = *o.move_off.last().unwrap_or(&0) as usize;
+                for &bc in lines {
+                    let len = o.moves.len();
+                    match o.moves.last_mut() {
+                        Some(m) if len > first && m[0] == f && m[1] == id && m[2] == bc => {
+                            m[3] += 1
+                        }
+                        _ => o.moves.push([f, id, bc, 1]),
+                    }
+                }
+            }
+            new.extend_from_slice(lines);
+        };
+        for (a, b, d) in hunks {
             let start = if b > 0 { a as usize - 1 } else { a as usize };
             if start < pos || start + b as usize > cur.len() {
                 o.anomalies += 1;
             }
             let start = start.clamp(pos, cur.len());
-            new.extend_from_slice(&cur[pos..start]);
+            keep(&mut new, &cur[pos..start], o);
             let end = (start + b as usize).min(cur.len());
             // Deaths, run-length encoded by birth commit.
             let first = *o.death_off.last().unwrap_or(&0) as usize; // first death of this commit
             for &bc in &cur[start..end] {
                 let len = o.deaths.len();
                 match o.deaths.last_mut() {
-                    Some(last) if len > first && last[0] == id && last[1] == bc => last[2] += 1,
-                    _ => o.deaths.push([id, bc, 1]),
+                    Some(last) if len > first && last[0] == dead_in && last[1] == bc => {
+                        last[2] += 1
+                    }
+                    _ => o.deaths.push([dead_in, bc, 1]),
                 }
             }
             pos = end;
             new.extend(std::iter::repeat_n(c, d as usize));
             born += d;
         }
-        new.extend_from_slice(&cur[pos..]);
+        keep(&mut new, &cur[pos..], o);
         if born > 0 {
             o.births.push([id, born]);
+        }
+        // A destination that already had lines (rare: git pairs only vanished sources
+        // with new paths) would be overwritten; count it so the index refuses to lie.
+        if from.is_some() && !state[id as usize].is_empty() {
+            o.anomalies += 1;
         }
         state[id as usize] = new;
     }

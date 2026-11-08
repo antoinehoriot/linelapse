@@ -1,6 +1,11 @@
 //! `linelapse --check`: compare indexed per-file line counts with the real blobs at HEAD and at
 //! three intermediate commits. Binary files (NUL in the first 8000 bytes, git's own rule)
 //! and submodules are skipped, as in the builder.
+//!
+//! Then compare the birth commit of every line of sampled files at HEAD with
+//! `git blame --first-parent`: blame dates a line by when it reached the first-parent
+//! history, the index's own definition, and follows whole-file renames. Counts alone
+//! cannot catch a wrong birth date; this does.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -67,6 +72,132 @@ fn real_counts(repo: &Path, rev: &str) -> Result<HashMap<String, i64>, String> {
         }
     }
     Ok(counts)
+}
+
+/// Birth commit (as a first-parent position) of every line of `path` at HEAD, per git blame.
+fn blame_histogram(
+    repo: &Path,
+    path: &str,
+    pos: &HashMap<&str, u32>,
+) -> Result<Vec<(u32, i64)>, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["blame", "--first-parent", "-l", "-s", "HEAD", "--", path])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!("git blame failed on {path}"));
+    }
+    let mut h: std::collections::BTreeMap<u32, i64> = Default::default();
+    for line in out.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        let tok = line.split(|&b| b == b' ').next().unwrap_or(&[]);
+        let tok = String::from_utf8_lossy(tok);
+        // A boundary (root) commit is printed as '^' plus 39 hex digits.
+        let sha = tok.trim_start_matches('^');
+        let c = match pos.get(sha) {
+            Some(&c) => c,
+            None => {
+                *pos.iter()
+                    .find(|(h, _)| h.starts_with(sha) && sha.len() >= 39)
+                    .ok_or_else(|| format!("blame names {sha}, not first-parent"))?
+                    .1
+            }
+        };
+        *h.entry(c).or_default() += 1;
+    }
+    Ok(h.into_iter().collect())
+}
+
+/// A sampled file and its indexed (birth commit, live lines) histogram.
+type Pick<'a> = (u32, &'a Vec<(u32, i64)>);
+
+/// Sampled files whose per-line birth commits differ from `git blame`, and the share of
+/// lines that agree. `sample` = how many live files to check (evenly spread by path).
+pub fn blame(repo: &Path, data: &Data, sample: usize) -> Result<(usize, usize, f64), String> {
+    // Called after `run`, which leaves the engine at HEAD.
+    let live: Vec<u32> = (0..data.meta.files.len())
+        .filter(|&f| data.engine.file_counts()[f] > 0)
+        .map(|f| f as u32)
+        .collect();
+    let step = live.len().div_ceil(sample.max(1)).max(1);
+    let picked: Vec<u32> = live.iter().copied().step_by(step).collect();
+    let ours = data.engine.birth_histograms(&picked);
+    let pos: HashMap<&str, u32> = data
+        .meta
+        .commits
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.hash.as_str(), i as u32))
+        .collect();
+    let threads = std::thread::available_parallelism().map_or(4, |p| p.get());
+    let chunks: Vec<Vec<Pick>> = picked
+        .iter()
+        .copied()
+        .zip(ours.iter())
+        .collect::<Vec<_>>()
+        .chunks(picked.len().div_ceil(threads).max(1))
+        .map(|c| c.to_vec())
+        .collect();
+    let results: Vec<Result<(usize, i64, i64), String>> = std::thread::scope(|s| {
+        let hs: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                let pos = &pos;
+                s.spawn(move || {
+                    let (mut bad, mut agree, mut total) = (0usize, 0i64, 0i64);
+                    for (f, mine) in chunk {
+                        let path = &data.meta.files[f as usize];
+                        let theirs = blame_histogram(repo, path, pos)?;
+                        let mut m: HashMap<u32, (i64, i64)> = HashMap::new();
+                        for &(c, k) in mine {
+                            m.entry(c).or_default().0 += k;
+                        }
+                        for &(c, k) in &theirs {
+                            m.entry(c).or_default().1 += k;
+                        }
+                        let ok: i64 = m.values().map(|&(a, b)| a.min(b)).sum();
+                        let n: i64 = theirs.iter().map(|e| e.1).sum();
+                        if ok != n || mine.iter().map(|e| e.1).sum::<i64>() != n {
+                            bad += 1;
+                            if bad <= 3 {
+                                println!("  blame differs on {path}: {ok}/{n} lines agree");
+                            }
+                        }
+                        agree += ok;
+                        total += n;
+                    }
+                    Ok((bad, agree, total))
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err("blame thread panicked".into()))
+            })
+            .collect()
+    });
+    let (mut bad, mut agree, mut total) = (0, 0, 0);
+    for r in results {
+        let (b, a, t) = r?;
+        bad += b;
+        agree += a;
+        total += t;
+    }
+    let share = if total > 0 {
+        agree as f64 / total as f64
+    } else {
+        1.0
+    };
+    println!(
+        "blame at HEAD: {} files sampled, {} differ, {:.3}% of {} lines agree on birth commit",
+        picked.len(),
+        bad,
+        100.0 * share,
+        total
+    );
+    Ok((picked.len(), bad, share))
 }
 
 /// Returns the number of mismatching files over all checked commits.
@@ -187,18 +318,50 @@ mod tests {
         git(&dir, &["mv", "a.c", "src/a.c"]);
         git(&dir, &["rm", "-q", "bin.dat"]);
         git(&dir, &["commit", "-qm", "move"]);
+        // Rename with an edit, a swap of two files, and a rename whose old path is reused.
+        let body = |tag: &str| -> Vec<u8> {
+            (0..12)
+                .map(|i| format!("{tag} line {i}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        write(&dir, "p.txt", &body("p"));
+        write(&dir, "q.txt", &body("q"));
+        write(&dir, "r.txt", &body("r"));
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "three files"]);
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        git(&dir, &["mv", "p.txt", "docs/p.md"]);
+        let mut p = body("p");
+        p.extend_from_slice(b"one more\n");
+        write(&dir, "docs/p.md", &p);
+        git(&dir, &["mv", "q.txt", "tmp"]);
+        git(&dir, &["mv", "r.txt", "q.txt"]);
+        git(&dir, &["mv", "tmp", "r.txt"]);
+        git(&dir, &["mv", "src/a.c", "src/b.c"]);
+        write(&dir, "src/a.c", b"brand new\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "renames"]);
         let tmp_cache = dir.join("cache");
         let progress = crate::build::Progress::default();
         crate::build::build(&dir, &tmp_cache, &progress).expect("build");
         let mut data = crate::app::load(&tmp_cache).expect("load");
-        assert_eq!(data.engine.len(), 5, "first-parent commits");
+        assert_eq!(data.engine.len(), 7, "first-parent commits");
         assert_eq!(
             crate::story::source_of(&data.meta.commits[3]),
             "branch side"
         );
         assert_eq!(super::run(&dir, &mut data).expect("check"), 0);
-        // HEAD: src/a.c 5 + with space 3 + é.md 3 + side/new.rs 2 = 13 live lines.
-        assert_eq!(*data.engine.totals.last().unwrap(), 13);
+        // HEAD: src/b.c 5 + src/a.c 1 + with space 3 + é.md 3 + side/new.rs 2
+        // + docs/p.md 13 + q.txt 12 + r.txt 12 = 51 live lines.
+        assert_eq!(*data.engine.totals.last().unwrap(), 51);
+        // p.txt -> docs/p.md keeps its 12 lines' birth (1 new line). git pairs only a
+        // vanished path with a new one, so the q/r swap (24 lines) and src/a.c -> src/b.c
+        // with a new src/a.c (5 lines) stay deaths plus births, as in `git blame`.
+        // Born: 1 + 24 + 5 + 1 ("brand new") = 31. Dead: 24 + 5 = 29.
+        assert_eq!(data.engine.churn.last(), Some(&(31, 29)));
+        let (files, bad, share) = super::blame(&dir, &data, 100).expect("blame");
+        assert_eq!((files, bad, share), (8, 0, 1.0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

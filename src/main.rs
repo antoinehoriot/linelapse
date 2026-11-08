@@ -64,7 +64,10 @@ fn main() {
         let phase = Mutex::new(String::new());
         let code = match app::load_or_build(&repo, rebuild, &progress, &phase).and_then(|mut d| {
             let path = std::path::PathBuf::from(&d.meta.repo);
-            check::run(&path, &mut d)
+            let k = check::run(&path, &mut d)?;
+            // Birth dates vs git blame: reported, not yet part of the pass/fail verdict.
+            check::blame(&path, &d, 300)?;
+            Ok(k)
         }) {
             Ok(0) => {
                 println!("OK: 0 mismatches");

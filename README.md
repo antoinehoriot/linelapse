@@ -13,10 +13,10 @@
 | | |
 |---|---|
 | Full indexing | 32 s |
-| Cache on disk | 126 MB |
+| Cache on disk | 144 MB |
 | Playback | 120 fps, frame p95 under 10 ms |
 | Jump to any commit | under 0.3 ms |
-| Accuracy | 0 mismatches over 97,316 files, checked against git at 4 commits (`--check`) |
+| Accuracy | 0 line-count mismatches over 97,316 files at 4 commits; birth commits agree with `git blame --first-parent` on 99.98% of lines in 300 sampled files (`--check`) |
 | 20 s video at 1080p | rendered in 6 s |
 
 ## What you see
@@ -28,7 +28,7 @@
 - **Key moments.** Markers on the commits that changed the most lines. Click one to jump there.
 - **Where code came from.** The side panel ranks the sources of the live lines in view: the maintainer tree named in each merge (`netdev/net-next`, `drm/drm`...), the merged branch, or the author of a direct commit. It updates live during playback.
 - **A source's territory.** Click a source: tiles keep the age colour of that source's own lines and fade where it owns less. Its commits light up on the timeline.
-- **Half-life.** How long it took for half of the lines ever written in the current view to disappear (Kaplan-Meier, with lines still alive censored at HEAD). Linux: 6.8 years. `drivers/gpu`: 14.6 years.
+- **Half-life.** How long it took for half of the lines ever written in the current view to disappear (Kaplan-Meier, with lines still alive censored at HEAD). Linux: 11.3 years. `drivers/gpu`: 17.5 years.
 - **Languages.** Press `l` to colour tiles by the language with the most live lines.
 
 ### Modes
@@ -110,7 +110,7 @@ Videos are rendered offscreen, with no window and no screen-recording permission
 ## How it works
 
 1. One `git log -p -U0 --first-parent` process per core, each on a slice of history.
-2. Every line gets a birth commit and a death commit. Events are run-length encoded per (commit, file).
+2. Every line gets a birth commit and a death commit. Renamed files keep their lines' birth commits (the lines are recorded as moved, not as deleted and re-added). Events are run-length encoded per (commit, file).
 3. Files are numbered in path order, so every directory is a contiguous id range.
 4. The viewer keeps per-file state with checkpoints: a jump replays a few hundred commits at most.
 5. The side panel and the territory view are live trackers updated on every step. Full rescans (new view, new source, long jump) run on a background thread and catch up with the playhead when they land, so they never block a frame.
@@ -124,7 +124,7 @@ Videos are rendered offscreen, with no window and no screen-recording permission
 ## Known limits
 
 - Lines are dated by when they reached the mainline (often a merge), not by their author's commit.
-- Renames are not followed (a rename is a deletion plus a creation). Binary files and submodules are ignored.
+- Renames are followed when git pairs a vanished path with a new one (`-M50%`). Copies are not, and neither are two files swapping names in one commit (as in `git blame`). Binary files and submodules are ignored.
 - The cache is rebuilt from scratch when HEAD changes (not incremental yet).
 - The window is tested on macOS only. On Linux (arm64 and x86_64, in Docker via `scripts/docker-linux.sh`), the build, the test suite, `--check` and `--record` pass; the window itself has not been tried on a Linux desktop yet.
 

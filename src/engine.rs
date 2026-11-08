@@ -25,6 +25,10 @@ pub struct Events<B: AsRef<[u8]>> {
     /// (file, birth commit, n) runs, grouped by death commit.
     pub deaths: B,
     pub death_off: B,
+    /// (from file, to file, birth commit, n) runs, grouped by commit: lines carried over by
+    /// a rename. They keep their birth commit; a move is neither a birth nor a death.
+    pub moves: B,
+    pub move_off: B,
 }
 
 // Files are little-endian and mmap is page-aligned, so reinterpreting is valid on the
@@ -48,6 +52,10 @@ impl<B: AsRef<[u8]>> Events<B> {
     fn deaths_of(&self, c: usize) -> &[u32] {
         let o = u32s(self.death_off.as_ref());
         &u32s(self.deaths.as_ref())[3 * o[c] as usize..3 * o[c + 1] as usize]
+    }
+    fn moves_of(&self, c: usize) -> &[u32] {
+        let o = u32s(self.move_off.as_ref());
+        &u32s(self.moves.as_ref())[4 * o[c] as usize..4 * o[c + 1] as usize]
     }
 }
 
@@ -84,6 +92,11 @@ impl Key {
                         data[src_of[r[1] as usize] as usize] -= sign * r[2] as i64;
                     }
                 }
+                for r in ev.moves_of(c).as_chunks::<4>().0 {
+                    let into = i64::from((lo..hi).contains(&r[1]));
+                    let out = i64::from((lo..hi).contains(&r[0]));
+                    data[src_of[r[2] as usize] as usize] += sign * (into - out) * r[3] as i64;
+                }
             }
             Key::Territory { src } => {
                 let nf = data.len() / 2;
@@ -102,57 +115,85 @@ impl Key {
                         data[nf + f] -= k * rel[bc];
                     }
                 }
+                for r in ev.moves_of(c).as_chunks::<4>().0 {
+                    let bc = r[2] as usize;
+                    if src_of[bc] == src {
+                        let (from, to, k) = (r[0] as usize, r[1] as usize, sign * r[3] as i64);
+                        data[from] -= k;
+                        data[nf + from] -= k * rel[bc];
+                        data[to] += k;
+                        data[nf + to] += k * rel[bc];
+                    }
+                }
             }
         }
     }
 }
 
-/// Kaplan-Meier median lifetime, in days, of every line ever born in files `lo..hi`.
+/// Kaplan-Meier median lifetime, in days, of the lines that lived in files `lo..hi`.
 /// Lines still alive at the last commit are right-censored there (they stay in the risk
-/// set until then), so young directories are not biased toward short lives. `None` when
-/// fewer than half of the lines ever died: the half-life is longer than the history.
+/// set until then), so young directories are not biased toward short lives. A line that a
+/// rename carries into the range enters the risk set at its age then (left truncation);
+/// one carried out leaves it, censored at that age. For the whole repository moves cancel
+/// out. `None` when fewer than half of the lines ever died: the half-life is longer than
+/// the history.
 fn half_life_days<B: AsRef<[u8]>>(ev: &Events<B>, rel: &[i64], lo: u32, hi: u32) -> Option<f64> {
     let n = rel.len();
     let end = rel[n - 1];
     let days = |secs: i64| (secs.max(0) / 86400) as usize;
     let span = days(end) + 1;
-    let mut born = vec![0i64; n];
+    let mut net = vec![0i64; n]; // lines in the range at the end, by birth commit
+    let mut entered = vec![0i64; span]; // by age at entry (0 for a birth)
     let mut died = vec![0i64; span]; // deaths by lifetime in days
-    let mut dead_from = vec![0i64; n]; // deaths by birth commit
+    let mut left = vec![0i64; span]; // carried out of the range, by age then
+    let inr = |f: u32| (lo..hi).contains(&f);
     for c in 0..n {
         for r in ev.births_of(c).as_chunks::<2>().0 {
-            if (lo..hi).contains(&r[0]) {
-                born[c] += r[1] as i64;
+            if inr(r[0]) {
+                entered[0] += r[1] as i64;
+                net[c] += r[1] as i64;
             }
         }
         for r in ev.deaths_of(c).as_chunks::<3>().0 {
-            if (lo..hi).contains(&r[0]) {
+            if inr(r[0]) {
                 let bc = r[1] as usize;
                 died[days(rel[c] - rel[bc]).min(span - 1)] += r[2] as i64;
-                dead_from[bc] += r[2] as i64;
+                net[bc] -= r[2] as i64;
+            }
+        }
+        for r in ev.moves_of(c).as_chunks::<4>().0 {
+            let (bc, k) = (r[2] as usize, r[3] as i64);
+            let age = days(rel[c] - rel[bc]).min(span - 1);
+            match (inr(r[0]), inr(r[1])) {
+                (false, true) => {
+                    entered[age] += k;
+                    net[bc] += k;
+                }
+                (true, false) => {
+                    left[age] += k;
+                    net[bc] -= k;
+                }
+                _ => {}
             }
         }
     }
     let mut censored = vec![0i64; span]; // still alive, by age at the last commit
     for c in 0..n {
-        let alive = born[c] - dead_from[c];
-        if alive > 0 {
-            censored[days(end - rel[c]).min(span - 1)] += alive;
+        if net[c] > 0 {
+            censored[days(end - rel[c]).min(span - 1)] += net[c];
         }
     }
-    let mut at_risk: i64 = born.iter().sum();
+    let mut at_risk: i64 = 0;
     let mut surv = 1.0f64;
     for d in 0..span {
-        if at_risk <= 0 {
-            break;
-        }
-        if died[d] > 0 {
+        at_risk += entered[d];
+        if at_risk > 0 && died[d] > 0 {
             surv *= 1.0 - died[d] as f64 / at_risk as f64;
             if surv <= 0.5 {
                 return Some(d as f64);
             }
         }
-        at_risk -= died[d] + censored[d];
+        at_risk -= died[d] + censored[d] + left[d];
     }
     None
 }
@@ -271,6 +312,8 @@ impl Engine<Mmap> {
             birth_off: map("birth_off.u32")?,
             deaths: map("deaths.u32")?,
             death_off: map("death_off.u32")?,
+            moves: map("moves.u32")?,
+            move_off: map("move_off.u32")?,
         };
         Ok(Engine::new(ev, times, nfiles))
     }
@@ -295,6 +338,7 @@ impl<B: AsRef<[u8]>> Engine<B> {
         assert!(n > 0);
         assert_eq!(u32s(ev.birth_off.as_ref()).len(), n + 1);
         assert_eq!(u32s(ev.death_off.as_ref()).len(), n + 1);
+        assert_eq!(u32s(ev.move_off.as_ref()).len(), n + 1);
         let max_ck = (CHECKPOINT_BUDGET / (nfiles.max(1) * 16)).max(2);
         let stride = n.div_ceil(max_ck).max(64);
         let rel: Vec<i64> = times.iter().map(|t| t - times[0]).collect();
@@ -409,6 +453,14 @@ impl<B: AsRef<[u8]>> Engine<B> {
             self.state.count[f] -= sign * k;
             self.state.sum[f] -= sign * k * self.rel(bc);
             dead += k as u64;
+        }
+        for r in ev.moves_of(c).as_chunks::<4>().0 {
+            let (from, to, bc, k) = (r[0] as usize, r[1] as usize, r[2] as usize, r[3] as i64);
+            let s = sign * k * self.rel(bc);
+            self.state.count[from] -= sign * k;
+            self.state.sum[from] -= s;
+            self.state.count[to] += sign * k;
+            self.state.sum[to] += s;
         }
         for tr in &mut self.trackers {
             if let (Some(key), true) = (tr.key, tr.valid) {
@@ -571,6 +623,38 @@ impl<B: AsRef<[u8]>> Engine<B> {
         move || half_life_days(&ev, &rel, lo, hi)
     }
 
+    /// Live lines at the last commit, per birth commit, for each file in `files` (sorted
+    /// pairs). One pass over every event; used by `--check` to compare with `git blame`.
+    pub fn birth_histograms(&self, files: &[u32]) -> Vec<Vec<(u32, i64)>> {
+        use std::collections::BTreeMap;
+        let slot: std::collections::HashMap<u32, usize> =
+            files.iter().enumerate().map(|(i, &f)| (f, i)).collect();
+        let mut h: Vec<BTreeMap<u32, i64>> = vec![BTreeMap::new(); files.len()];
+        for c in 0..self.len() {
+            for r in self.ev.births_of(c).as_chunks::<2>().0 {
+                if let Some(&i) = slot.get(&r[0]) {
+                    *h[i].entry(c as u32).or_default() += r[1] as i64;
+                }
+            }
+            for r in self.ev.deaths_of(c).as_chunks::<3>().0 {
+                if let Some(&i) = slot.get(&r[0]) {
+                    *h[i].entry(r[1]).or_default() -= r[2] as i64;
+                }
+            }
+            for r in self.ev.moves_of(c).as_chunks::<4>().0 {
+                if let Some(&i) = slot.get(&r[0]) {
+                    *h[i].entry(r[2]).or_default() -= r[3] as i64;
+                }
+                if let Some(&i) = slot.get(&r[1]) {
+                    *h[i].entry(r[2]).or_default() += r[3] as i64;
+                }
+            }
+        }
+        h.into_iter()
+            .map(|m| m.into_iter().filter(|e| e.1 != 0).collect())
+            .collect()
+    }
+
     /// Run pending rescans on this thread (tests and the video recorder).
     pub fn sync(&mut self) {
         for j in self.take_jobs() {
@@ -590,32 +674,87 @@ mod tests {
 
     /// Synthetic history of single lines (file, birth, death); death = u32::MAX if alive.
     fn build(lines: &[(u32, u32, u32)], n: usize, nf: usize) -> Engine<Vec<u8>> {
-        let (mut births, mut boff) = (Vec::new(), vec![0u32]);
-        let (mut deaths, mut doff) = (Vec::new(), vec![0u32]);
-        for c in 0..n as u32 {
-            for f in 0..nf as u32 {
-                let k = lines.iter().filter(|l| l.0 == f && l.1 == c).count() as u32;
-                if k > 0 {
-                    births.extend([f, k]);
-                }
-                for b in 0..=c {
-                    let k = lines
-                        .iter()
-                        .filter(|l| l.0 == f && l.1 == b && l.2 == c)
-                        .count() as u32;
-                    if k > 0 {
-                        deaths.extend([f, b, k]);
-                    }
-                }
+        let moved: Vec<Line> = lines
+            .iter()
+            .map(|&(f, b, d)| Line {
+                f,
+                b,
+                d,
+                mv: u32::MAX,
+                to: f,
+            })
+            .collect();
+        build_moved(&moved, n, nf)
+    }
+
+    /// A line in file `f` from commit `b`, carried to file `to` at commit `mv` (u32::MAX:
+    /// never), dead at commit `d` (u32::MAX: alive) in whichever file it is then.
+    #[derive(Clone, Copy)]
+    struct Line {
+        f: u32,
+        b: u32,
+        d: u32,
+        mv: u32,
+        to: u32,
+    }
+
+    impl Line {
+        /// Whether the rename happens while the line is alive.
+        fn moves(&self) -> bool {
+            self.mv < self.d && self.f != self.to
+        }
+        fn file_at(&self, t: u32) -> u32 {
+            if self.moves() && t >= self.mv {
+                self.to
+            } else {
+                self.f
             }
-            boff.push(births.len() as u32 / 2);
-            doff.push(deaths.len() as u32 / 3);
+        }
+        fn alive(&self, t: u32) -> bool {
+            self.b <= t && self.d > t
+        }
+    }
+
+    fn build_moved(lines: &[Line], n: usize, nf: usize) -> Engine<Vec<u8>> {
+        use std::collections::BTreeMap;
+        let mut births: Vec<BTreeMap<u32, u32>> = vec![BTreeMap::new(); n];
+        let mut deaths: Vec<BTreeMap<(u32, u32), u32>> = vec![BTreeMap::new(); n];
+        let mut moves: Vec<BTreeMap<(u32, u32, u32), u32>> = vec![BTreeMap::new(); n];
+        for l in lines {
+            *births[l.b as usize].entry(l.f).or_default() += 1;
+            if l.moves() && (l.mv as usize) < n {
+                *moves[l.mv as usize].entry((l.f, l.to, l.b)).or_default() += 1;
+            }
+            if (l.d as usize) < n {
+                *deaths[l.d as usize]
+                    .entry((l.file_at(l.d), l.b))
+                    .or_default() += 1;
+            }
+        }
+        let (mut bv, mut boff) = (Vec::new(), vec![0u32]);
+        let (mut dv, mut doff) = (Vec::new(), vec![0u32]);
+        let (mut mvv, mut moff) = (Vec::new(), vec![0u32]);
+        for c in 0..n {
+            for (&f, &k) in &births[c] {
+                bv.extend([f, k]);
+            }
+            for (&(f, b), &k) in &deaths[c] {
+                dv.extend([f, b, k]);
+            }
+            for (&(f, to, b), &k) in &moves[c] {
+                mvv.extend([f, to, b, k]);
+            }
+            boff.push(bv.len() as u32 / 2);
+            doff.push(dv.len() as u32 / 3);
+            moff.push(mvv.len() as u32 / 4);
         }
         let ev = Events {
-            births: le32(&births),
+            births: le32(&bv),
             birth_off: le32(&boff),
-            deaths: le32(&deaths),
+            deaths: le32(&dv),
             death_off: le32(&doff),
+            moves: le32(&mvv),
+            move_off: le32(&moff),
         };
         let times = (0..n as i64).map(|c| 1_000_000 + c * 86400).collect();
         Engine::new(ev, times, nf)
@@ -812,5 +951,111 @@ mod tests {
         let lines = [(0, 0, u32::MAX), (0, 1, u32::MAX)];
         let e = build(&lines, 4, 1);
         assert_eq!((e.half_life_job(0, 1))(), None);
+    }
+
+    /// Lines that change files: per-file state, both trackers and the subtree half-life
+    /// match a brute force over the lines themselves.
+    #[test]
+    fn moves_keep_birth_and_match_brute_force() {
+        let (n, nf) = (240, 6);
+        let mut x = 11u64;
+        let mut rnd = |m: u32| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as u32 % m
+        };
+        let lines: Vec<Line> = (0..2500)
+            .map(|_| {
+                let (f, b) = (rnd(nf as u32), rnd(n as u32));
+                let d = b + 1 + rnd(300);
+                let d = if d >= n as u32 { u32::MAX } else { d };
+                // Half of the lines are carried to another file before they die.
+                let (mv, to) = if rnd(2) == 0 {
+                    let mv = b + 1 + rnd(150);
+                    (mv, (f + 1 + rnd(nf as u32 - 1)) % nf as u32)
+                } else {
+                    (u32::MAX, f)
+                };
+                Line { f, b, d, mv, to }
+            })
+            .collect();
+        let mut e = build_moved(&lines, n, nf);
+        let src: Vec<u32> = (0..n as u32).map(|c| (c * 5) % 4).collect();
+        e.set_sources(src.clone());
+        let (lo, hi, sel) = (1u32, 3u32, 2u32);
+        e.watch_provenance(lo, hi);
+        e.watch_territory(Some(sel));
+        for &t in &[0usize, 239, 120, 121, 119, 30, 200, 5, 238, 64, 0] {
+            e.seek(t);
+            e.sync();
+            let tt = t as u32;
+            let live: Vec<&Line> = lines.iter().filter(|l| l.alive(tt)).collect();
+            for f in 0..nf {
+                let mine: Vec<_> = live.iter().filter(|l| l.file_at(tt) == f as u32).collect();
+                let a = e.agg(f, f + 1);
+                assert_eq!(a.count, mine.len() as i64, "count t={t} f={f}");
+                let want: i64 = mine.iter().map(|l| l.b as i64 * 86400).sum();
+                assert_eq!(a.sum, want, "birth sum t={t} f={f}");
+            }
+            let prov = e.provenance().expect("provenance");
+            for s in 0..4u32 {
+                let want = live
+                    .iter()
+                    .filter(|l| (lo..hi).contains(&l.file_at(tt)) && src[l.b as usize] == s)
+                    .count() as i64;
+                assert_eq!(prov[s as usize], want, "prov t={t} s={s}");
+            }
+            for f in 0..nf {
+                let want = live
+                    .iter()
+                    .filter(|l| l.file_at(tt) == f as u32 && src[l.b as usize] == sel)
+                    .count() as i64;
+                assert_eq!(
+                    e.territory(f, f + 1).map(|a| a.count),
+                    Some(want),
+                    "terr t={t}"
+                );
+            }
+        }
+        // Half-life of a subtree: Kaplan-Meier with entry when a line is carried in and
+        // censoring when it is carried out or still alive at the end. Ages in days (one
+        // commit per day).
+        for (lo, hi) in [(0u32, 6u32), (1, 3), (4, 5)] {
+            let inr = |f: u32| (lo..hi).contains(&f);
+            let last = n as u32 - 1;
+            // (entry age, exit age, died) of every stay in the range.
+            let mut stays = Vec::new();
+            for l in &lines {
+                let end = l.d.min(last);
+                let moved = l.moves() && l.mv <= end;
+                let died = l.d != u32::MAX;
+                if moved {
+                    if inr(l.f) && !inr(l.to) {
+                        stays.push((0, l.mv - l.b, false));
+                    } else if !inr(l.f) && inr(l.to) {
+                        stays.push((l.mv - l.b, end - l.b, died));
+                    } else if inr(l.f) {
+                        stays.push((0, end - l.b, died));
+                    }
+                } else if inr(l.f) {
+                    stays.push((0, end - l.b, died));
+                }
+            }
+            let mut surv = 1.0f64;
+            let mut want = None;
+            for d in 0..n as u32 {
+                let at_risk = stays.iter().filter(|s| s.0 <= d && s.1 >= d).count();
+                let dead = stays.iter().filter(|s| s.2 && s.1 == d).count();
+                if at_risk > 0 && dead > 0 {
+                    surv *= 1.0 - dead as f64 / at_risk as f64;
+                    if surv <= 0.5 {
+                        want = Some(d as f64);
+                        break;
+                    }
+                }
+            }
+            assert_eq!((e.half_life_job(lo, hi))(), want, "half-life {lo}..{hi}");
+        }
     }
 }
