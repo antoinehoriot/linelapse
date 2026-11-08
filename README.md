@@ -44,7 +44,7 @@
 cargo install --git https://github.com/antoinehoriot/linelapse
 ```
 
-Needs `git` on the PATH, and `ffmpeg` only for MP4/GIF export. Tested on macOS; GPUI is built with its `runtime_shaders` feature, so the Xcode Metal Toolchain is not required.
+Needs `git` on the PATH, and `ffmpeg` only for MP4/GIF export. GPUI is built with its `runtime_shaders` feature, so the Xcode Metal Toolchain is not required. On Linux, install the GPUI system libraries first (Debian/Ubuntu: `libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev libvulkan-dev`).
 
 ## Usage
 
@@ -94,7 +94,7 @@ linelapse stands on ideas from tools worth knowing:
 - Lines are dated by when they reached the mainline (often a merge), not by their author's commit.
 - Renames are not followed (a rename is a deletion plus a creation). Binary files and submodules are ignored.
 - The cache is rebuilt from scratch when HEAD changes (not incremental yet).
-- Only tested on macOS so far.
+- The window is tested on macOS only. On Linux (arm64, in Docker via `scripts/docker-linux.sh`), the build, the test suite, `--check` and `--record` pass; the window itself has not been tried on a Linux desktop yet.
 
 ## License
 

@@ -10,6 +10,10 @@ name = "linelapse"
 path = "src/main.rs"
 
 [dependencies]
+# Pinned: libc 0.2.190 removed ENOATTR on Linux, which breaks xattr 0.2.3 (pulled in by
+# gpui -> gpui_http_client -> zed-async-tar). `cargo install` ignores Cargo.lock, so the
+# pin has to live here. Remove once gpui's tar dependency moves to xattr >= 1.
+libc = "=0.2.189"
 ab_glyph = "0.2.32"
 epaint_default_fonts = "0.37.0"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
