@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Replay a git repository's history, line by line"
+repository = "https://github.com/antoinehoriot/linelapse"
+homepage = "https://github.com/antoinehoriot/linelapse"
+readme = "README.md"
+keywords = ["git", "history", "visualization", "treemap", "gpui"]
+categories = ["command-line-utilities", "visualization", "development-tools"]
+exclude = ["docs/*.gif"]
 
 [[bin]]
 name = "linelapse"
