@@ -1,10 +1,11 @@
 # Checks on Linux: fmt, clippy -D warnings, tests (same gate as scripts/check.sh).
-# Manual only while the repository is private (runner minutes are billed there).
-# Once public (free runners), replace the trigger with:
-#   on: { push: { branches: [main] }, pull_request: {} }
+# Standard runners are free for public repositories.
 name: ci
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
