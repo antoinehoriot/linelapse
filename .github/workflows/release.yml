@@ -4,7 +4,11 @@
 # macOS uses the floating `macos-latest` label: the pinned `macos-14` image was retired
 # (v0.2.0's tag run failed with "The configuration 'macos-14-arm64-us-default' is not
 # supported" and its macOS archives were built locally). The x86_64 target is
-# cross-compiled on that arm64 runner.
+# cross-compiled on that arm64 runner. Linux arm64 builds natively on `ubuntu-22.04-arm`
+# (free for public repositories), same glibc floor (2.35) as x86_64.
+# Build jobs only upload artifacts; one release job then writes SHA256SUMS over all
+# archives and publishes everything at once, so a release never lacks a platform or
+# its checksums. A manual run (workflow_dispatch) stops at the artifacts.
 name: release
 
 on:
@@ -27,6 +31,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -49,9 +55,37 @@ jobs:
           cp target/${{ matrix.target }}/release/linelapse README.md LICENSE "$name"/
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            linelapse-*.tar.gz
+            linelapse-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          test "$(ls linelapse-*.tar.gz | wc -l)" -eq 4
+          sha256sum linelapse-*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            linelapse-*.tar.gz
-            linelapse-*.tar.gz.sha256
+            dist/linelapse-*.tar.gz
+            dist/linelapse-*.tar.gz.sha256
+            dist/SHA256SUMS
