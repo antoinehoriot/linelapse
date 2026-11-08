@@ -177,6 +177,11 @@ pub struct Engine<B: AsRef<[u8]>> {
     pub totals: Vec<i64>,
     /// (lines born, lines dead) in each commit.
     pub churn: Vec<(u64, u64)>,
+    /// Calendar year of each cohort (lines grouped by the year they were born).
+    pub cohort_years: Vec<i32>,
+    /// Live lines per cohort after each commit, flattened: row `c` is
+    /// `cohorts[c * ny..(c + 1) * ny]`.
+    cohorts: Vec<i64>,
     cur: usize,
     state: Snapshot,
     src_of: Arc<Vec<u32>>,
@@ -184,6 +189,18 @@ pub struct Engine<B: AsRef<[u8]>> {
     rel: Arc<Vec<i64>>,
     nsrc: usize,
     trackers: [Tracker; 2], // 0 = provenance, 1 = territory
+}
+
+/// Calendar year (UTC) of a unix timestamp (civil-from-days, Howard Hinnant).
+pub fn year_of(unix: i64) -> i32 {
+    let z = unix.div_euclid(86400) + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2)) as i32
 }
 
 impl Engine<Mmap> {
@@ -227,6 +244,8 @@ impl<B: AsRef<[u8]>> Engine<B> {
             checkpoints: Vec::new(),
             totals: Vec::with_capacity(n),
             churn: Vec::with_capacity(n),
+            cohort_years: Vec::new(),
+            cohorts: Vec::new(),
             cur: 0,
             state: Snapshot {
                 count: vec![0; nfiles],
@@ -248,7 +267,35 @@ impl<B: AsRef<[u8]>> Engine<B> {
             }
         }
         e.cur = n - 1;
+        e.build_cohorts();
         e
+    }
+
+    /// Live lines per birth-year cohort after commit `c` (oldest cohort first).
+    pub fn cohort_row(&self, c: usize) -> &[i64] {
+        let ny = self.cohort_years.len();
+        &self.cohorts[c * ny..(c + 1) * ny]
+    }
+
+    /// One pass over all events: running live-line count per birth year.
+    fn build_cohorts(&mut self) {
+        let year: Vec<i32> = self.times.iter().map(|&t| year_of(t)).collect();
+        let first = year.iter().copied().min().unwrap_or(1970);
+        let last = year.iter().copied().max().unwrap_or(first);
+        let ny = (last - first + 1) as usize;
+        self.cohort_years = (first..=last).collect();
+        let n = self.len();
+        let mut row = vec![0i64; ny];
+        self.cohorts = Vec::with_capacity(n * ny);
+        for c in 0..n {
+            for r in self.ev.births_of(c).chunks_exact(2) {
+                row[(year[c] - first) as usize] += r[1] as i64;
+            }
+            for r in self.ev.deaths_of(c).chunks_exact(3) {
+                row[(year[r[1] as usize] - first) as usize] -= r[2] as i64;
+            }
+            self.cohorts.extend_from_slice(&row);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -597,5 +644,28 @@ mod tests {
         assert_eq!(e.territory(0, nf).map(|a| a.count), Some(want));
         e.watch_territory(None);
         assert_eq!(e.territory(0, nf), None);
+    }
+
+    #[test]
+    fn cohorts_match_brute_force() {
+        let (n, nf) = (400, 3);
+        let lines = random_lines(5, 2500, n, nf, 300);
+        // One commit per day from 1,000,000 s: spans 1970 and 1971.
+        let e = build(&lines, n, nf);
+        let years: Vec<i32> = e.times.iter().map(|&t| year_of(t)).collect();
+        assert_eq!(e.cohort_years, vec![1970, 1971]);
+        for t in [0, 1, 199, 300, 399] {
+            let row = e.cohort_row(t);
+            assert_eq!(row.iter().sum::<i64>(), e.totals[t]);
+            for (k, &y) in e.cohort_years.iter().enumerate() {
+                let want = alive(&lines, t)
+                    .filter(|l| years[l.1 as usize] == y)
+                    .count() as i64;
+                assert_eq!(row[k], want, "t={t} y={y}");
+            }
+        }
+        assert_eq!(year_of(0), 1970);
+        assert_eq!(year_of(1_794_088_322), 2026);
+        assert_eq!(year_of(951_782_400), 2000); // 2000-02-29
     }
 }

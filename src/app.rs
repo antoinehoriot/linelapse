@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     Bounds, Context, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    Pixels, Render, Rgba, SharedString, Window, canvas, div, point, prelude::*, px, quad, size,
+    PathBuilder, Pixels, Render, Rgba, SharedString, Window, canvas, div, point, prelude::*, px,
+    quad, size,
 };
 use memmap2::Mmap;
 
@@ -142,6 +143,8 @@ struct Ready {
     focus: Option<u32>,
     /// Commits of the selected source, for the timeline strip.
     focus_ticks: Vec<usize>,
+    /// Cohort bands of the timeline, rebuilt only when its rect changes.
+    timeline_paths: Option<(Rect, Vec<(gpui::Path<Pixels>, Hsla)>)>,
     /// Background rescans report here.
     tx: Sender<(Done, Duration)>,
     rx: Receiver<(Done, Duration)>,
@@ -225,6 +228,7 @@ impl Scrubber {
                     prov_stale: true,
                     focus: None,
                     focus_ticks: Vec::new(),
+                    timeline_paths: None,
                     tx,
                     rx,
                     stats: Stats::default(),
@@ -640,6 +644,47 @@ impl Ready {
     }
 }
 
+/// One closed band per birth-year cohort across the timeline, coloured by the cohort's
+/// age at HEAD (same ramp as the map).
+fn cohort_paths(e: &Engine<Mmap>, tl: Rect) -> Vec<(gpui::Path<Pixels>, Hsla)> {
+    let n = e.len();
+    let peak = e.totals.iter().copied().max().unwrap_or(1).max(1) as f32;
+    let cols = tl.w.max(2.0) as usize;
+    let ny = e.cohort_years.len();
+    // bottom[i][k]: y of the bottom of cohort k at column i (cumulative stack).
+    let mut edges = vec![vec![0f32; ny + 1]; cols];
+    for (i, col) in edges.iter_mut().enumerate() {
+        let cc = (((i + 1) * n) / cols).clamp(1, n) - 1;
+        let mut y = tl.y + tl.h;
+        col[0] = y;
+        for (k, &v) in e.cohort_row(cc).iter().enumerate() {
+            y -= tl.h * v.max(0) as f32 / peak;
+            col[k + 1] = y;
+        }
+    }
+    let last_year = *e.cohort_years.last().unwrap_or(&1970);
+    let x = |i: usize| tl.x + tl.w * i as f32 / (cols - 1) as f32;
+    let mut out = Vec::new();
+    for k in 0..ny {
+        if edges.iter().all(|c| c[k] - c[k + 1] < 0.05) {
+            continue; // empty band
+        }
+        let mut b = PathBuilder::fill();
+        b.move_to(point(px(x(0)), px(edges[0][k + 1])));
+        for (i, col) in edges.iter().enumerate().skip(1) {
+            b.line_to(point(px(x(i)), px(col[k + 1])));
+        }
+        for i in (0..cols).rev() {
+            b.line_to(point(px(x(i)), px(edges[i][k])));
+        }
+        b.close();
+        if let Ok(path) = b.build() {
+            out.push((path, age_color((last_year - e.cohort_years[k]) as f64)));
+        }
+    }
+    out
+}
+
 fn inset(r: Rect, d: f32) -> Rect {
     Rect {
         x: r.x + d,
@@ -760,6 +805,18 @@ impl Render for Scrubber {
                 thousands(m.dead as i64),
                 cm.subject.chars().take(70).collect::<String>()
             )
+        } else if let Some((x, _)) = r.mouse.filter(|&(x, y)| contains(tl, x, y)) {
+            let hc = (((x - tl.x) / tl.w).clamp(0.0, 1.0) * (n - 1) as f32) as usize;
+            let row = r.data.engine.cohort_row(hc);
+            let total = r.data.engine.totals[hc].max(1);
+            let first = r.data.engine.cohort_years.first().copied().unwrap_or(1970);
+            format!(
+                "{}  ·  {} live lines  ·  {:.1}% still from {}",
+                date(r.data.meta.commits[hc].time),
+                thousands(r.data.engine.totals[hc]),
+                100.0 * row.first().copied().unwrap_or(0) as f64 / total as f64,
+                first
+            )
         } else if let Some(t) = r.hovered_tile() {
             let nd = &r.data.tree.nodes[t.node];
             let a = r.data.engine.agg(nd.lo as usize, nd.hi as usize);
@@ -794,32 +851,19 @@ impl Render for Scrubber {
             .hovered_tile()
             .filter(|t| !t.frame)
             .map(|t| bounds(t.rect));
-        // Timeline sparkline: max total per pixel column.
-        let cols = tl.w.max(1.0) as usize;
-        let peak = r
-            .data
-            .engine
-            .totals
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(1)
-            .max(1) as f32;
-        let spark: Vec<f32> = (0..cols)
-            .map(|i| {
-                let (a, b) = (
-                    i * n / cols,
-                    ((i + 1) * n / cols).max(i * n / cols + 1).min(n),
-                );
-                r.data.engine.totals[a..b]
-                    .iter()
-                    .copied()
-                    .max()
-                    .unwrap_or(0) as f32
-                    / peak
-            })
-            .collect();
+        // Timeline: live lines stacked by the year they were born (oldest at the bottom).
+        // One filled path per cohort, cached until the timeline is resized: 15k quads per
+        // frame cost ~40 fps, 20-odd cached paths cost nothing. The part after the
+        // playhead is dimmed with a single overlay.
         let head_x = r.commit_x(c, tl);
+        if r.timeline_paths.as_ref().is_none_or(|(k, _)| *k != tl) {
+            r.timeline_paths = Some((tl, cohort_paths(&r.data.engine, tl)));
+        }
+        let stack = r
+            .timeline_paths
+            .as_ref()
+            .map(|(_, p)| p.clone())
+            .unwrap_or_default();
         let marks: Vec<(f32, bool)> = r
             .data
             .moments
@@ -1068,13 +1112,11 @@ impl Render for Scrubber {
                             window.paint_quad(quad(b, px(0.), gpui::transparent_black(), px(1.5), rgba(0xffffff), Default::default()));
                         }
                         window.paint_quad(gpui::fill(bounds(tl), rgba(0x1c1c21)));
-                        let bw = tl.w / spark.len() as f32;
-                        for (i, &v) in spark.iter().enumerate() {
-                            let h = tl.h * v;
-                            let x = tl.x + i as f32 * bw;
-                            let col = if x <= head_x { rgba(0x52525b) } else { rgba(0x2e2e35) };
-                            window.paint_quad(gpui::fill(bounds(Rect { x, y: tl.y + tl.h - h, w: bw + 0.5, h }), col));
+                        for (path, col) in stack {
+                            window.paint_path(path, col);
                         }
+                        let rest = Rect { x: head_x, y: tl.y, w: (tl.x + tl.w - head_x).max(0.0), h: tl.h };
+                        window.paint_quad(gpui::fill(bounds(rest), rgba(0x1c1c21).opacity(0.7)));
                         for (x, hot) in marks {
                             let col = if hot { rgba(0xfcf3a4) } else { rgba(0xa1a1aa) };
                             window.paint_quad(gpui::fill(bounds(Rect { x: x - 3.0, y: tl.y - 12.0, w: 6.0, h: 6.0 }), col));
