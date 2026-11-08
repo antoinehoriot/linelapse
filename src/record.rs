@@ -31,6 +31,8 @@ pub struct RecordOpts {
     pub from: f64,
     pub view: usize,
     pub focus: Option<u32>,
+    /// Half-life of the view, computed once before recording.
+    pub half_life: Option<Option<f64>>,
 }
 
 /// Logical layout size: the window's default, scaled to the output height.
@@ -239,9 +241,17 @@ fn draw_frame(cv: &mut Canvas, data: &Data, o: &RecordOpts, vw: f32, vh: f32) {
         cv.text(&label, x, HEADER_H + 42.0, 10.0, hex(0xa1a1aa), 40.0);
     }
     cv.text(
+        &crate::app::half_life_text(o.half_life),
+        px0 + 12.0,
+        HEADER_H + 58.0,
+        12.0,
+        hex(0xe4e4e7),
+        PANEL_W - 24.0,
+    );
+    cv.text(
         "Where live lines came from",
         px0 + 12.0,
-        HEADER_H + 70.0,
+        HEADER_H + 80.0,
         11.0,
         hex(0xa1a1aa),
         PANEL_W - 24.0,
@@ -249,7 +259,7 @@ fn draw_frame(cv: &mut Canvas, data: &Data, o: &RecordOpts, vw: f32, vh: f32) {
     if let Some(by_src) = e.provenance() {
         let rows = provenance_rows(data, o.focus, by_src);
         let sum: i64 = rows.iter().map(|r| r.2).sum::<i64>().max(1);
-        let mut y = HEADER_H + 92.0;
+        let mut y = HEADER_H + 100.0;
         for (src, name, k) in rows {
             if y > HEADER_H + map.h - 30.0 {
                 break;

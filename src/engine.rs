@@ -30,6 +30,11 @@ pub struct Events<B: AsRef<[u8]>> {
 // Files are little-endian and mmap is page-aligned, so reinterpreting is valid on the
 // little-endian targets we build for. Alignment and length are checked.
 fn u32s(b: &[u8]) -> &[u32] {
+    // An empty file or buffer (e.g. a history with no deletions) may come with a dangling,
+    // unaligned pointer: it holds no data, so answer without touching it.
+    if b.is_empty() {
+        return &[];
+    }
     assert!(b.len().is_multiple_of(4) && (b.as_ptr() as usize).is_multiple_of(4));
     // SAFETY: length and alignment checked above; u32 has no invalid bit patterns.
     unsafe { std::slice::from_raw_parts(b.as_ptr().cast(), b.len() / 4) }
@@ -100,6 +105,56 @@ impl Key {
             }
         }
     }
+}
+
+/// Kaplan-Meier median lifetime, in days, of every line ever born in files `lo..hi`.
+/// Lines still alive at the last commit are right-censored there (they stay in the risk
+/// set until then), so young directories are not biased toward short lives. `None` when
+/// fewer than half of the lines ever died: the half-life is longer than the history.
+fn half_life_days<B: AsRef<[u8]>>(ev: &Events<B>, rel: &[i64], lo: u32, hi: u32) -> Option<f64> {
+    let n = rel.len();
+    let end = rel[n - 1];
+    let days = |secs: i64| (secs.max(0) / 86400) as usize;
+    let span = days(end) + 1;
+    let mut born = vec![0i64; n];
+    let mut died = vec![0i64; span]; // deaths by lifetime in days
+    let mut dead_from = vec![0i64; n]; // deaths by birth commit
+    for c in 0..n {
+        for r in ev.births_of(c).chunks_exact(2) {
+            if (lo..hi).contains(&r[0]) {
+                born[c] += r[1] as i64;
+            }
+        }
+        for r in ev.deaths_of(c).chunks_exact(3) {
+            if (lo..hi).contains(&r[0]) {
+                let bc = r[1] as usize;
+                died[days(rel[c] - rel[bc]).min(span - 1)] += r[2] as i64;
+                dead_from[bc] += r[2] as i64;
+            }
+        }
+    }
+    let mut censored = vec![0i64; span]; // still alive, by age at the last commit
+    for c in 0..n {
+        let alive = born[c] - dead_from[c];
+        if alive > 0 {
+            censored[days(end - rel[c]).min(span - 1)] += alive;
+        }
+    }
+    let mut at_risk: i64 = born.iter().sum();
+    let mut surv = 1.0f64;
+    for d in 0..span {
+        if at_risk <= 0 {
+            break;
+        }
+        if died[d] > 0 {
+            surv *= 1.0 - died[d] as f64 / at_risk as f64;
+            if surv <= 0.5 {
+                return Some(d as f64);
+            }
+        }
+        at_risk -= died[d] + censored[d];
+    }
+    None
 }
 
 /// A full rescan to run off the UI thread.
@@ -501,6 +556,16 @@ impl<B: AsRef<[u8]>> Engine<B> {
         })
     }
 
+    /// A half-life computation for files `lo..hi`, to run off the UI thread (it scans
+    /// every event once). Result in days; see `half_life_days`.
+    pub fn half_life_job(&self, lo: u32, hi: u32) -> impl FnOnce() -> Option<f64> + Send + use<B>
+    where
+        B: Send + Sync + 'static,
+    {
+        let (ev, rel) = (Arc::clone(&self.ev), Arc::clone(&self.rel));
+        move || half_life_days(&ev, &rel, lo, hi)
+    }
+
     /// Run pending rescans on this thread (tests and the video recorder).
     pub fn sync(&mut self) {
         for j in self.take_jobs() {
@@ -712,5 +777,35 @@ mod tests {
         for t in 0..n {
             assert_eq!(e.cohort_row(t).iter().sum::<i64>(), e.totals[t], "t={t}");
         }
+    }
+
+    /// Kaplan-Meier on hand-made lifetimes, with and without censoring.
+    #[test]
+    fn half_life_kaplan_meier() {
+        // 4 commits, one per day. File 0: 4 lines born at commit 0 die at commits 1, 1, 2, 3
+        // (lifetimes 1, 1, 2, 3 days): empirical median = 1 day (S drops to 0.5 at day 1).
+        let lines = [(0, 0, 1), (0, 0, 1), (0, 0, 2), (0, 0, 3)];
+        let e = build(&lines, 4, 2);
+        assert_eq!((e.half_life_job(0, 1))(), Some(1.0));
+        // File 1: 2 lines born at 0, one dies at day 2, one alive (censored at day 3):
+        // S(2) = 1 - 1/2 = 0.5 -> median 2 days.
+        let lines = [(1, 0, 2), (1, 0, u32::MAX)];
+        let e = build(&lines, 4, 2);
+        assert_eq!((e.half_life_job(1, 2))(), Some(2.0));
+        // Censoring matters: 1 line born at 0 dies at day 3; 3 lines born at day 2 are
+        // alive (censored at age 1). At day 3 only the old line is at risk: S = 0 -> 3.
+        // Ignoring censoring (all 4 at risk) would give S = 0.75 and no median.
+        let lines = [
+            (0, 0, 3),
+            (0, 2, u32::MAX),
+            (0, 2, u32::MAX),
+            (0, 2, u32::MAX),
+        ];
+        let e = build(&lines, 4, 1);
+        assert_eq!((e.half_life_job(0, 1))(), Some(3.0));
+        // Nothing ever died: no half-life within the history.
+        let lines = [(0, 0, u32::MAX), (0, 1, u32::MAX)];
+        let e = build(&lines, 4, 1);
+        assert_eq!((e.half_life_job(0, 1))(), None);
     }
 }

@@ -111,6 +111,10 @@ fn main() {
                 from: value("--at").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                 view,
                 focus,
+                half_life: Some({
+                    let node = &d.tree.nodes[view];
+                    (d.engine.half_life_job(node.lo, node.hi))()
+                }),
             };
             record::run(&mut d, &o)
         });

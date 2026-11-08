@@ -151,6 +151,12 @@ struct Ready {
     /// Background rescans report here.
     tx: Sender<(Done, Duration)>,
     rx: Receiver<(Done, Duration)>,
+    /// Half-life (days) per view node, computed once per view off the UI thread.
+    /// `Some(None)`: computed, no half-life within the history.
+    half_life: std::collections::HashMap<usize, Option<f64>>,
+    half_life_pending: Option<usize>,
+    hl_tx: Sender<(usize, Option<f64>)>,
+    hl_rx: Receiver<(usize, Option<f64>)>,
     stats: Stats,
     fps: f64,
 }
@@ -219,6 +225,7 @@ impl Scrubber {
                     .and_then(|p| data.tree.find(p))
                     .unwrap_or(0);
                 let (tx, rx) = channel();
+                let (hl_tx, hl_rx) = channel();
                 Screen::Ready(Box::new(Ready {
                     data,
                     view,
@@ -234,6 +241,10 @@ impl Scrubber {
                     timeline_paths: None,
                     tx,
                     rx,
+                    half_life: std::collections::HashMap::new(),
+                    half_life_pending: None,
+                    hl_tx,
+                    hl_rx,
                     stats: Stats::default(),
                     fps: 0.0,
                 }))
@@ -269,6 +280,16 @@ pub(crate) fn timeline_rect(vw: f32, vh: f32) -> Rect {
         y: vh - TIMELINE_H + 18.0,
         w: vw - 2.0 * PAD,
         h: TIMELINE_H - 34.0,
+    }
+}
+
+/// Panel line for a view's half-life (`None` = still computing).
+pub(crate) fn half_life_text(h: Option<Option<f64>>) -> String {
+    match h {
+        None => "Half-life of a line: computing…".to_string(),
+        Some(None) => "Half-life of a line: longer than the history".to_string(),
+        Some(Some(d)) if d < 365.0 => format!("Half-life of a line: {d:.0} days"),
+        Some(Some(d)) => format!("Half-life of a line: {:.1} years", d / 365.25),
     }
 }
 
@@ -573,6 +594,33 @@ impl Ready {
     /// threads, and rebuild the provenance rows. Playback steps keep the trackers current
     /// for free; only a new view, a new source or a long jump costs a rescan, and that
     /// never blocks a frame. Returns true while a rescan is in flight.
+    /// Start or collect the half-life of the current view. Returns true while computing.
+    fn refresh_half_life(&mut self) -> bool {
+        while let Ok((v, d)) = self.hl_rx.try_recv() {
+            self.half_life.insert(v, d);
+            self.half_life_pending = None;
+        }
+        if self.half_life.contains_key(&self.view) {
+            return false;
+        }
+        if self.half_life_pending.is_none() {
+            let node = &self.data.tree.nodes[self.view];
+            let job = self.data.engine.half_life_job(node.lo, node.hi);
+            let (tx, v) = (self.hl_tx.clone(), self.view);
+            self.half_life_pending = Some(v);
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                let d = job();
+                eprintln!(
+                    "half-life computed in {:.0} ms",
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+                let _ = tx.send((v, d));
+            });
+        }
+        true
+    }
+
     fn refresh_trackers(&mut self) -> bool {
         let e = &mut self.data.engine;
         while let Ok((done, took)) = self.rx.try_recv() {
@@ -813,7 +861,7 @@ impl Render for Scrubber {
         }
         let map = map_rect(vw, vh);
         r.build_tiles(map);
-        if r.refresh_trackers() {
+        if r.refresh_half_life() | r.refresh_trackers() {
             window.request_animation_frame(); // poll the background rescan
         }
 
@@ -1245,6 +1293,19 @@ impl Render for Scrubber {
                         })),
                     )
                     .child(div().h(px(14.0)))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgba(0xe4e4e7))
+                            .child(half_life_text(r.half_life.get(&r.view).copied())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgba(0x71717a))
+                            .child("time until half the lines ever written here were gone (Kaplan-Meier, whole history)"),
+                    )
+                    .child(div().h(px(10.0)))
                     .child(div().text_size(px(11.0)).child(if stale {
                         "Where live lines came from (computing…)".to_string()
                     } else {
