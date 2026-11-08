@@ -179,9 +179,10 @@ pub struct Engine<B: AsRef<[u8]>> {
     pub churn: Vec<(u64, u64)>,
     /// Calendar year of each cohort (lines grouped by the year they were born).
     pub cohort_years: Vec<i32>,
-    /// Live lines per cohort after each commit, flattened: row `c` is
-    /// `cohorts[c * ny..(c + 1) * ny]`.
+    /// Live lines per cohort, sampled every `cohort_step` commits, flattened: sample `k`
+    /// (state after commit `k * cohort_step`) is `cohorts[k * ny..(k + 1) * ny]`.
     cohorts: Vec<i64>,
+    cohort_step: usize,
     cur: usize,
     state: Snapshot,
     src_of: Arc<Vec<u32>>,
@@ -229,6 +230,12 @@ pub struct Agg {
 
 impl<B: AsRef<[u8]>> Engine<B> {
     pub fn new(ev: Events<B>, times: Vec<i64>, nfiles: usize) -> Self {
+        // Commit dates are untrusted: clamp to 1970..2100 so `lines * seconds` sums stay
+        // far from i64 overflow (4.1e9 s * 1e9 lines = 4.1e18 < 9.2e18).
+        let times: Vec<i64> = times
+            .into_iter()
+            .map(|t| t.clamp(0, 4_102_444_800))
+            .collect();
         let n = times.len();
         assert!(n > 0);
         assert_eq!(u32s(ev.birth_off.as_ref()).len(), n + 1);
@@ -246,6 +253,7 @@ impl<B: AsRef<[u8]>> Engine<B> {
             churn: Vec::with_capacity(n),
             cohort_years: Vec::new(),
             cohorts: Vec::new(),
+            cohort_step: 1,
             cur: 0,
             state: Snapshot {
                 count: vec![0; nfiles],
@@ -271,30 +279,50 @@ impl<B: AsRef<[u8]>> Engine<B> {
         e
     }
 
-    /// Live lines per birth-year cohort after commit `c` (oldest cohort first).
+    /// Live lines per birth-year cohort at commit `c` (oldest cohort first), from the
+    /// nearest sample at or before `c` (exact when the history has <= MAX_SAMPLES commits).
     pub fn cohort_row(&self, c: usize) -> &[i64] {
         let ny = self.cohort_years.len();
-        &self.cohorts[c * ny..(c + 1) * ny]
+        let k = c.min(self.len() - 1) / self.cohort_step;
+        &self.cohorts[k * ny..(k + 1) * ny]
     }
 
     /// One pass over all events: running live-line count per birth year.
+    ///
+    /// Commit dates are untrusted (git accepts any timestamp), so memory is bounded on
+    /// both axes: years are clamped to at most `MAX_YEARS` cohorts starting no earlier than
+    /// 1970 (outliers fall into the edge cohorts), and at most `MAX_SAMPLES` rows are kept.
     fn build_cohorts(&mut self) {
-        let year: Vec<i32> = self.times.iter().map(|&t| year_of(t)).collect();
-        let first = year.iter().copied().min().unwrap_or(1970);
-        let last = year.iter().copied().max().unwrap_or(first);
+        const MAX_YEARS: i32 = 100;
+        const MAX_SAMPLES: usize = 4096;
+        let raw: Vec<i32> = self.times.iter().map(|&t| year_of(t)).collect();
+        let first = raw.iter().copied().min().unwrap_or(1970).max(1970);
+        let last = raw
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(first)
+            .clamp(first, first + MAX_YEARS - 1);
+        let year: Vec<usize> = raw
+            .iter()
+            .map(|&y| (y.clamp(first, last) - first) as usize)
+            .collect();
         let ny = (last - first + 1) as usize;
         self.cohort_years = (first..=last).collect();
         let n = self.len();
+        self.cohort_step = n.div_ceil(MAX_SAMPLES).max(1);
         let mut row = vec![0i64; ny];
-        self.cohorts = Vec::with_capacity(n * ny);
+        self.cohorts = Vec::with_capacity(n.div_ceil(self.cohort_step) * ny);
         for c in 0..n {
             for r in self.ev.births_of(c).chunks_exact(2) {
-                row[(year[c] - first) as usize] += r[1] as i64;
+                row[year[c]] += r[1] as i64;
             }
             for r in self.ev.deaths_of(c).chunks_exact(3) {
-                row[(year[r[1] as usize] - first) as usize] -= r[2] as i64;
+                row[year[r[1] as usize]] -= r[2] as i64;
             }
-            self.cohorts.extend_from_slice(&row);
+            if c % self.cohort_step == 0 {
+                self.cohorts.extend_from_slice(&row);
+            }
         }
     }
 
@@ -667,5 +695,23 @@ mod tests {
         assert_eq!(year_of(0), 1970);
         assert_eq!(year_of(1_794_088_322), 2026);
         assert_eq!(year_of(951_782_400), 2000); // 2000-02-29
+    }
+
+    /// Forged commit dates (year 1 and year 9999) must not blow up cohort memory.
+    #[test]
+    fn cohorts_bounded_with_hostile_dates() {
+        let (n, nf) = (50, 2);
+        let lines = random_lines(3, 200, n, nf, 40);
+        let mut e = build(&lines, n, nf);
+        let mut times = e.times.clone();
+        times[10] = -62_135_596_800; // 0001-01-01
+        times[20] = 253_402_300_799; // 9999-12-31
+        e.times = times;
+        e.build_cohorts();
+        assert!(e.cohort_years.len() <= 100);
+        assert_eq!(e.cohort_years[0], 1970);
+        for t in 0..n {
+            assert_eq!(e.cohort_row(t).iter().sum::<i64>(), e.totals[t], "t={t}");
+        }
     }
 }
