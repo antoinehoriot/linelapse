@@ -127,6 +127,11 @@ mod tests {
                 "user.email=t@t",
                 "-c",
                 "commit.gpgsign=false",
+                // No detached background gc/maintenance outliving the test.
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "maintenance.auto=false",
             ])
             .args(args)
             .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")

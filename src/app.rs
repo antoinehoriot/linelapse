@@ -144,7 +144,7 @@ struct Ready {
     /// Commits of the selected source, for the timeline strip.
     focus_ticks: Vec<usize>,
     /// Cohort bands of the timeline, rebuilt only when its rect changes.
-    timeline_paths: Option<(Rect, Vec<(gpui::Path<Pixels>, Hsla)>)>,
+    timeline_paths: Option<(Rect, Vec<Band>)>,
     /// Background rescans report here.
     tx: Sender<(Done, Duration)>,
     rx: Receiver<(Done, Duration)>,
@@ -644,9 +644,12 @@ impl Ready {
     }
 }
 
+/// A filled timeline band and its colour.
+type Band = (gpui::Path<Pixels>, Hsla);
+
 /// One closed band per birth-year cohort across the timeline, coloured by the cohort's
 /// age at HEAD (same ramp as the map).
-fn cohort_paths(e: &Engine<Mmap>, tl: Rect) -> Vec<(gpui::Path<Pixels>, Hsla)> {
+fn cohort_paths(e: &Engine<Mmap>, tl: Rect) -> Vec<Band> {
     let n = e.len();
     let peak = e.totals.iter().copied().max().unwrap_or(1).max(1) as f32;
     let cols = tl.w.max(2.0) as usize;
