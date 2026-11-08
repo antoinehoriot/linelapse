@@ -1,10 +1,10 @@
-# Build release binaries when a version tag is pushed (or by hand).
-# Not run on every push: macOS runner minutes are expensive on private repos.
+# Build release binaries by hand only (Actions tab > release > Run workflow).
+# Deliberately NOT triggered by tags: on a private repo macOS minutes are billed, and
+# releases are built locally for now (macOS natively, Linux via scripts/docker-linux.sh).
+# Re-enable `push: tags: ["v*"]` once the repository is public (free runners).
 name: release
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
