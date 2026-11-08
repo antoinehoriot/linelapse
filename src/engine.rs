@@ -501,8 +501,7 @@ impl<B: AsRef<[u8]>> Engine<B> {
         })
     }
 
-    /// Run pending rescans on this thread (tests).
-    #[cfg(test)]
+    /// Run pending rescans on this thread (tests and the video recorder).
     pub fn sync(&mut self) {
         for j in self.take_jobs() {
             let d = j.run();

@@ -10,7 +10,11 @@ name = "linelapse"
 path = "src/main.rs"
 
 [dependencies]
+ab_glyph = "0.2.32"
+epaint_default_fonts = "0.37.0"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 memmap2 = "0.9.12"
+png = "0.18.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+tiny-skia = "0.12.0"

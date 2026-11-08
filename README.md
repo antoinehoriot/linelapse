@@ -23,6 +23,16 @@ cargo build --release
 ./target/release/linelapse . --bench                      # full playback, timings on stderr
 ```
 
+### Record a video
+
+```sh
+linelapse ~/code/linux --record linux.mp4                       # 1920x1080, 60 fps, 20 s
+linelapse ~/code/linux --record linux.gif --size 1280x720 --seconds 12
+linelapse . --record frames/ --source netdev/net --at 0.5       # PNG frames, from mid-history
+```
+
+The video is rendered offscreen (no window, no screen-recording permission), with the same layout, colours and panel as the app. MP4 and GIF need `ffmpeg` on the PATH; a directory gets PNG frames.
+
 Keys: space play/pause, ← → one commit (shift: 500), esc or backspace to go back.
 
 - **Click a directory** to zoom in.
@@ -49,4 +59,4 @@ The cache lives in `~/Library/Caches/linelapse/` (macOS) or `~/.cache/linelapse/
 
 ## License
 
-MIT
+MIT. Videos embed the Ubuntu Light font (Ubuntu Font Licence 1.0), via `epaint_default_fonts`.

@@ -18,12 +18,12 @@ use crate::story::{self, Moment};
 use crate::tree::Tree;
 use crate::treemap::{Rect, layout};
 
-const HEADER_H: f32 = 64.0;
-const TIMELINE_H: f32 = 84.0;
-const PANEL_W: f32 = 300.0;
-const PAD: f32 = 12.0;
+pub(crate) const HEADER_H: f32 = 64.0;
+pub(crate) const TIMELINE_H: f32 = 84.0;
+pub(crate) const PANEL_W: f32 = 300.0;
+pub(crate) const PAD: f32 = 12.0;
 const PLAY_SECONDS: f64 = 40.0;
-const MOMENTS: usize = 14;
+pub(crate) const MOMENTS: usize = 14;
 
 pub struct Data {
     pub meta: Meta,
@@ -110,12 +110,13 @@ enum Screen {
     Failed(String),
 }
 
-struct Tile {
-    rect: Rect,
-    node: usize,
-    frame: bool,
-    color: Hsla,
-    label: Option<SharedString>,
+pub struct Tile {
+    pub rect: Rect,
+    pub node: usize,
+    /// A directory frame drawn behind its children (title bar on top).
+    pub frame: bool,
+    pub color: Hsla,
+    pub label: Option<SharedString>,
 }
 
 #[derive(Default)]
@@ -249,7 +250,27 @@ impl Scrubber {
     }
 }
 
-fn rgba(hex: u32) -> Hsla {
+/// Map area for a window of `vw` x `vh` logical pixels.
+pub(crate) fn map_rect(vw: f32, vh: f32) -> Rect {
+    Rect {
+        x: PAD,
+        y: HEADER_H,
+        w: vw - 3.0 * PAD - PANEL_W,
+        h: vh - HEADER_H - TIMELINE_H,
+    }
+}
+
+/// Timeline bar area for a window of `vw` x `vh` logical pixels.
+pub(crate) fn timeline_rect(vw: f32, vh: f32) -> Rect {
+    Rect {
+        x: PAD,
+        y: vh - TIMELINE_H + 18.0,
+        w: vw - 2.0 * PAD,
+        h: TIMELINE_H - 34.0,
+    }
+}
+
+pub(crate) fn rgba(hex: u32) -> Hsla {
     gpui::rgb(hex).into()
 }
 
@@ -263,7 +284,7 @@ const AGE_STOPS: [(f64, u32); 6] = [
     (20.0, 0x2a2f6e),
 ];
 
-fn age_color(years: f64) -> Hsla {
+pub(crate) fn age_color(years: f64) -> Hsla {
     let y = years.clamp(0.0, 20.0);
     let i = AGE_STOPS
         .iter()
@@ -284,7 +305,7 @@ fn age_color(years: f64) -> Hsla {
 }
 
 /// Accent for the selected source in the panel and its commits on the timeline.
-const TERRITORY: u32 = 0x38bdf8;
+pub(crate) const TERRITORY: u32 = 0x38bdf8;
 /// What a tile fades to when none of its lines come from the selected source.
 const FADED: u32 = 0x1d1d22;
 
@@ -339,7 +360,7 @@ pub fn date(unix: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn thousands(n: i64) -> String {
+pub(crate) fn thousands(n: i64) -> String {
     let s = n.abs().to_string();
     let mut out = String::from(if n < 0 { "-" } else { "" });
     for (i, ch) in s.chars().enumerate() {
@@ -370,6 +391,121 @@ fn contains(r: Rect, x: f32, y: f32) -> bool {
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
 
+/// Panel rows for per-source line counts: top 10, the selected source if it is not among
+/// them, then "N other sources". `None` marks the aggregate row.
+pub(crate) fn provenance_rows(
+    data: &Data,
+    focus: Option<u32>,
+    by_src: &[i64],
+) -> Vec<(Option<u32>, String, i64)> {
+    let mut rows: Vec<(usize, i64)> = by_src
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|r| r.1 > 0)
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+    let rest: i64 = rows.iter().skip(10).map(|r| r.1).sum();
+    let mut out: Vec<(Option<u32>, String, i64)> = rows
+        .iter()
+        .take(10)
+        .map(|&(s, k)| (Some(s as u32), data.src_names[s].clone(), k))
+        .collect();
+    // Keep the selected source visible even when it is not in the top 10.
+    if let Some(f) = focus
+        && !out.iter().any(|r| r.0 == Some(f))
+        && let Some(&(_, k)) = rows.iter().find(|r| r.0 as u32 == f)
+    {
+        out.push((Some(f), data.src_names[f as usize].clone(), k));
+    }
+    if rest > 0 {
+        out.push((
+            None,
+            format!("{} other sources", thousands(rows.len() as i64 - 10)),
+            rest,
+        ));
+    }
+    out
+}
+
+/// Two-level treemap of `view`: its children, and inside each directory its own children.
+/// Shared by the window and the video recorder so both show exactly the same map.
+pub fn layout_tiles(data: &Data, view: usize, focus: Option<u32>, map: Rect) -> Vec<Tile> {
+    let mut tiles = Vec::new();
+    let (tree, e) = (&data.tree, &data.engine);
+    let kids = &tree.nodes[view].children;
+    let w: Vec<f64> = kids
+        .iter()
+        .map(|&k| {
+            e.agg(tree.nodes[k].lo as usize, tree.nodes[k].hi as usize)
+                .count
+                .max(0) as f64
+        })
+        .collect();
+    for (i, r) in layout(&w, map).into_iter().enumerate() {
+        if r.w < 1.0 || r.h < 1.0 {
+            continue;
+        }
+        let k = kids[i];
+        let node = &tree.nodes[k];
+        if node.is_file || node.children.is_empty() {
+            let a = e.agg(node.lo as usize, node.hi as usize);
+            tiles.push(Tile {
+                rect: inset(r, 0.5),
+                node: k,
+                frame: false,
+                color: tile_color(e, focus, node.lo as usize, node.hi as usize, a),
+                label: (r.w > 56.0 && r.h > 18.0).then(|| node.name.clone().into()),
+            });
+            continue;
+        }
+        let titled = r.w > 70.0 && r.h > 40.0;
+        tiles.push(Tile {
+            rect: r,
+            node: k,
+            frame: true,
+            color: rgba(0x26262b),
+            label: titled.then(|| format!("{}/", node.name).into()),
+        });
+        let top = if titled { 16.0 } else { 1.0 };
+        let inner = Rect {
+            x: r.x + 1.0,
+            y: r.y + top,
+            w: (r.w - 2.0).max(0.0),
+            h: (r.h - top - 1.0).max(0.0),
+        };
+        let gk = &node.children;
+        let gw: Vec<f64> = gk
+            .iter()
+            .map(|&g| {
+                e.agg(tree.nodes[g].lo as usize, tree.nodes[g].hi as usize)
+                    .count
+                    .max(0) as f64
+            })
+            .collect();
+        for (j, q) in layout(&gw, inner).into_iter().enumerate() {
+            if q.w < 0.5 || q.h < 0.5 {
+                continue;
+            }
+            let g = &tree.nodes[gk[j]];
+            let a = e.agg(g.lo as usize, g.hi as usize);
+            let name = if g.is_file {
+                g.name.clone()
+            } else {
+                format!("{}/", g.name)
+            };
+            tiles.push(Tile {
+                rect: inset(q, 0.5),
+                node: gk[j],
+                frame: false,
+                color: tile_color(e, focus, g.lo as usize, g.hi as usize, a),
+                label: (q.w > 56.0 && q.h > 18.0).then(|| name.into()),
+            });
+        }
+    }
+    tiles
+}
+
 impl Ready {
     fn n(&self) -> usize {
         self.data.engine.len()
@@ -379,24 +515,6 @@ impl Ready {
         let t0 = Instant::now();
         self.data.engine.seek(c);
         self.stats.seek_times.push(t0.elapsed());
-    }
-
-    fn map_rect(vw: f32, vh: f32) -> Rect {
-        Rect {
-            x: PAD,
-            y: HEADER_H,
-            w: vw - 3.0 * PAD - PANEL_W,
-            h: vh - HEADER_H - TIMELINE_H,
-        }
-    }
-
-    fn timeline_rect(vw: f32, vh: f32) -> Rect {
-        Rect {
-            x: PAD,
-            y: vh - TIMELINE_H + 18.0,
-            w: vw - 2.0 * PAD,
-            h: TIMELINE_H - 34.0,
-        }
     }
 
     fn commit_x(&self, c: usize, tl: Rect) -> f32 {
@@ -427,78 +545,7 @@ impl Ready {
     }
 
     fn build_tiles(&mut self, map: Rect) {
-        self.tiles.clear();
-        let (tree, e) = (&self.data.tree, &self.data.engine);
-        let kids = &tree.nodes[self.view].children;
-        let w: Vec<f64> = kids
-            .iter()
-            .map(|&k| {
-                e.agg(tree.nodes[k].lo as usize, tree.nodes[k].hi as usize)
-                    .count
-                    .max(0) as f64
-            })
-            .collect();
-        for (i, r) in layout(&w, map).into_iter().enumerate() {
-            if r.w < 1.0 || r.h < 1.0 {
-                continue;
-            }
-            let k = kids[i];
-            let node = &tree.nodes[k];
-            if node.is_file || node.children.is_empty() {
-                let a = e.agg(node.lo as usize, node.hi as usize);
-                self.tiles.push(Tile {
-                    rect: inset(r, 0.5),
-                    node: k,
-                    frame: false,
-                    color: tile_color(e, self.focus, node.lo as usize, node.hi as usize, a),
-                    label: (r.w > 56.0 && r.h > 18.0).then(|| node.name.clone().into()),
-                });
-                continue;
-            }
-            let titled = r.w > 70.0 && r.h > 40.0;
-            self.tiles.push(Tile {
-                rect: r,
-                node: k,
-                frame: true,
-                color: rgba(0x26262b),
-                label: titled.then(|| format!("{}/", node.name).into()),
-            });
-            let top = if titled { 16.0 } else { 1.0 };
-            let inner = Rect {
-                x: r.x + 1.0,
-                y: r.y + top,
-                w: (r.w - 2.0).max(0.0),
-                h: (r.h - top - 1.0).max(0.0),
-            };
-            let gk = &node.children;
-            let gw: Vec<f64> = gk
-                .iter()
-                .map(|&g| {
-                    e.agg(tree.nodes[g].lo as usize, tree.nodes[g].hi as usize)
-                        .count
-                        .max(0) as f64
-                })
-                .collect();
-            for (j, q) in layout(&gw, inner).into_iter().enumerate() {
-                if q.w < 0.5 || q.h < 0.5 {
-                    continue;
-                }
-                let g = &tree.nodes[gk[j]];
-                let a = e.agg(g.lo as usize, g.hi as usize);
-                let name = if g.is_file {
-                    g.name.clone()
-                } else {
-                    format!("{}/", g.name)
-                };
-                self.tiles.push(Tile {
-                    rect: inset(q, 0.5),
-                    node: gk[j],
-                    frame: false,
-                    color: tile_color(e, self.focus, g.lo as usize, g.hi as usize, a),
-                    label: (q.w > 56.0 && q.h > 18.0).then(|| name.into()),
-                });
-            }
-        }
+        self.tiles = layout_tiles(&self.data, self.view, self.focus, map);
     }
 
     fn hovered_tile(&self) -> Option<&Tile> {
@@ -541,40 +588,14 @@ impl Ready {
                 let _ = tx.send((done, t0.elapsed()));
             });
         }
-        let Some(by_src) = e.provenance() else {
+        let busy = e.busy();
+        let Some(by_src) = self.data.engine.provenance() else {
             self.prov_stale = true;
             return true;
         };
-        let mut rows: Vec<(usize, i64)> = by_src
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|r| r.1 > 0)
-            .collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
-        let rest: i64 = rows.iter().skip(10).map(|r| r.1).sum();
-        let mut out: Vec<(Option<u32>, String, i64)> = rows
-            .iter()
-            .take(10)
-            .map(|&(s, k)| (Some(s as u32), self.data.src_names[s].clone(), k))
-            .collect();
-        // Keep the selected source visible even when it is not in the top 10.
-        if let Some(f) = self.focus
-            && !out.iter().any(|r| r.0 == Some(f))
-            && let Some(&(_, k)) = rows.iter().find(|r| r.0 as u32 == f)
-        {
-            out.push((Some(f), self.data.src_names[f as usize].clone(), k));
-        }
-        if rest > 0 {
-            out.push((
-                None,
-                format!("{} other sources", thousands(rows.len() as i64 - 10)),
-                rest,
-            ));
-        }
-        self.prov = out;
+        self.prov = provenance_rows(&self.data, self.focus, by_src);
         self.prov_stale = false;
-        e.busy()
+        busy
     }
 
     fn set_focus(&mut self, src: Option<u32>) {
@@ -647,14 +668,14 @@ impl Ready {
 /// A filled timeline band and its colour.
 type Band = (gpui::Path<Pixels>, Hsla);
 
-/// One closed band per birth-year cohort across the timeline, coloured by the cohort's
-/// age at HEAD (same ramp as the map).
-fn cohort_paths(e: &Engine<Mmap>, tl: Rect) -> Vec<Band> {
+/// Polygons (outline points) of each birth-year cohort band across the timeline, with
+/// the cohort's colour (its age at HEAD, same ramp as the map). Shared with the recorder.
+pub(crate) fn cohort_polygons(e: &Engine<Mmap>, tl: Rect) -> Vec<(Vec<(f32, f32)>, Hsla)> {
     let n = e.len();
     let peak = e.totals.iter().copied().max().unwrap_or(1).max(1) as f32;
     let cols = tl.w.max(2.0) as usize;
     let ny = e.cohort_years.len();
-    // bottom[i][k]: y of the bottom of cohort k at column i (cumulative stack).
+    // edges[i][k]: y of the bottom of cohort k at column i (cumulative stack).
     let mut edges = vec![vec![0f32; ny + 1]; cols];
     for (i, col) in edges.iter_mut().enumerate() {
         let cc = (((i + 1) * n) / cols).clamp(1, n) - 1;
@@ -672,20 +693,27 @@ fn cohort_paths(e: &Engine<Mmap>, tl: Rect) -> Vec<Band> {
         if edges.iter().all(|c| c[k] - c[k + 1] < 0.05) {
             continue; // empty band
         }
-        let mut b = PathBuilder::fill();
-        b.move_to(point(px(x(0)), px(edges[0][k + 1])));
-        for (i, col) in edges.iter().enumerate().skip(1) {
-            b.line_to(point(px(x(i)), px(col[k + 1])));
-        }
-        for i in (0..cols).rev() {
-            b.line_to(point(px(x(i)), px(edges[i][k])));
-        }
-        b.close();
-        if let Ok(path) = b.build() {
-            out.push((path, age_color((last_year - e.cohort_years[k]) as f64)));
-        }
+        let mut pts: Vec<(f32, f32)> = (0..cols).map(|i| (x(i), edges[i][k + 1])).collect();
+        pts.extend((0..cols).rev().map(|i| (x(i), edges[i][k])));
+        out.push((pts, age_color((last_year - e.cohort_years[k]) as f64)));
     }
     out
+}
+
+/// The cohort bands as GPUI paths (cached by the window).
+fn cohort_paths(e: &Engine<Mmap>, tl: Rect) -> Vec<Band> {
+    cohort_polygons(e, tl)
+        .into_iter()
+        .filter_map(|(pts, col)| {
+            let mut b = PathBuilder::fill();
+            b.move_to(point(px(pts[0].0), px(pts[0].1)));
+            for &(x, y) in &pts[1..] {
+                b.line_to(point(px(x), px(y)));
+            }
+            b.close();
+            b.build().ok().map(|p| (p, col))
+        })
+        .collect()
 }
 
 fn inset(r: Rect, d: f32) -> Rect {
@@ -781,14 +809,14 @@ impl Render for Scrubber {
             r.seek(r.pos.round() as usize);
             window.request_animation_frame();
         }
-        let map = Ready::map_rect(vw, vh);
+        let map = map_rect(vw, vh);
         r.build_tiles(map);
         if r.refresh_trackers() {
             window.request_animation_frame(); // poll the background rescan
         }
 
         let c = r.data.engine.current();
-        let tl = Ready::timeline_rect(vw, vh);
+        let tl = timeline_rect(vw, vh);
         let view_node = &r.data.tree.nodes[r.view];
         let view_agg = r
             .data
@@ -1069,7 +1097,7 @@ impl Render for Scrubber {
                     let vp = window.viewport_size();
                     let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
                     let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
-                    let tl = Ready::timeline_rect(vw, vh);
+                    let tl = timeline_rect(vw, vh);
                     if let Some(i) = r.moment_at(x, y, tl) {
                         r.playing = false;
                         r.pos = r.data.moments[i].commit as f64;
@@ -1078,7 +1106,7 @@ impl Render for Scrubber {
                         r.dragging = true;
                         r.playing = false;
                         r.seek_to_x(x, tl);
-                    } else if contains(Ready::map_rect(vw, vh), x, y)
+                    } else if contains(map_rect(vw, vh), x, y)
                         && let Some(z) = r.zoom_target(x, y) {
                             r.view = z;
                         }
@@ -1091,7 +1119,7 @@ impl Render for Scrubber {
                 r.mouse = Some((x, y));
                 if r.dragging {
                     let vp = window.viewport_size();
-                    r.seek_to_x(x, Ready::timeline_rect(f32::from(vp.width), f32::from(vp.height)));
+                    r.seek_to_x(x, timeline_rect(f32::from(vp.width), f32::from(vp.height)));
                 }
                 cx.notify();
             }))

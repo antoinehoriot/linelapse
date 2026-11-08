@@ -2,6 +2,8 @@
 //!
 //! Usage: linelapse [repo] [--rebuild] [--check] [--bench] [--at <0..1>] [--path <dir>]
 //!              [--source <name>]
+//!        linelapse [repo] --record <out.mp4|out.gif|dir/> [--size 1920x1080] [--fps 60]
+//!              [--seconds 20] [--at <0..1>] [--path <dir>] [--source <name>]
 //! Keys: space play/pause, left/right one commit (shift: 500), escape/backspace up.
 //! Click a directory to zoom in; click a marker on the timeline to jump to that moment;
 //! click a source in the provenance panel to see its territory.
@@ -10,6 +12,7 @@ mod app;
 mod build;
 mod check;
 mod engine;
+mod record;
 mod story;
 mod tree;
 mod treemap;
@@ -33,7 +36,17 @@ fn main() {
     for a in &args {
         if skip_next {
             skip_next = false;
-        } else if a == "--at" || a == "--path" || a == "--source" {
+        } else if [
+            "--at",
+            "--path",
+            "--source",
+            "--record",
+            "--size",
+            "--fps",
+            "--seconds",
+        ]
+        .contains(&a.as_str())
+        {
             skip_next = true;
         } else if !a.starts_with("--") {
             positional = Some(a.clone());
@@ -62,6 +75,48 @@ fn main() {
             }
         };
         std::process::exit(code);
+    }
+
+    if let Some(out) = value("--record") {
+        let progress = build::Progress::default();
+        let phase = Mutex::new(String::new());
+        let (w, h) = value("--size")
+            .and_then(|s| {
+                let (w, h) = s.split_once('x')?;
+                Some((w.parse().ok()?, h.parse().ok()?))
+            })
+            .unwrap_or((1920u32, 1080u32));
+        let result = app::load_or_build(&repo, rebuild, &progress, &phase).and_then(|mut d| {
+            let view = value("--path").and_then(|p| d.tree.find(&p)).unwrap_or(0);
+            let focus = match value("--source") {
+                Some(name) => Some(
+                    d.src_names
+                        .iter()
+                        .position(|s| *s == name)
+                        .ok_or(format!("unknown source: {name}"))? as u32,
+                ),
+                None => None,
+            };
+            let o = record::RecordOpts {
+                out,
+                // Even sizes: yuv420p needs them.
+                width: w.max(320) & !1,
+                height: h.max(240) & !1,
+                fps: value("--fps").and_then(|v| v.parse().ok()).unwrap_or(60),
+                seconds: value("--seconds")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(20.0),
+                from: value("--at").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                view,
+                focus,
+            };
+            record::run(&mut d, &o)
+        });
+        if let Err(e) = result {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        return;
     }
 
     let opts = app::Opts {

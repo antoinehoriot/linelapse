@@ -12,8 +12,12 @@ pub fn source_of(c: &CommitMeta) -> String {
     if !c.merge {
         return c.author.clone();
     }
-    if let Some(i) = s.find(" of ")
-        && let Some(url) = s[i + 4..].split_whitespace().next()
+    // Any URL-like token names the tree: "Merge tag 'x' of git://host/.../netdev/net",
+    // and the older "Merge git://host/.../davem/net-2.6" or "Merge host:/path/rmk/linux-arm".
+    if let Some(url) = s
+        .split_whitespace()
+        .skip(1)
+        .find(|t| t.contains("://") || t.contains(":/") || t.starts_with("git@"))
     {
         let url = url
             .trim_end_matches(['/', ':', ','])
@@ -45,8 +49,15 @@ pub fn sources(commits: &[CommitMeta]) -> (Vec<String>, Vec<u32>) {
     let mut idx = std::collections::HashMap::new();
     let per = commits
         .iter()
-        .map(|c| {
-            let s = source_of(c);
+        .enumerate()
+        .map(|(i, c)| {
+            // The root commit is usually an import of pre-git history (Linux: v2.6.12-rc2),
+            // not code its author wrote: label it as such.
+            let s = if i == 0 {
+                "initial import".to_string()
+            } else {
+                source_of(c)
+            };
             *idx.entry(s.clone()).or_insert_with(|| {
                 names.push(s);
                 (names.len() - 1) as u32
@@ -115,6 +126,13 @@ mod tests {
         assert_eq!(source_of(&c(true, "Linus", url)), "foo/bar");
         assert_eq!(source_of(&c(false, "Ada", "fix: x")), "Ada");
         assert_eq!(source_of(&c(true, "Ada", "weird")), "merge by Ada");
+        let old = "Merge git://git.kernel.org/pub/scm/linux/kernel/git/davem/net-2.6";
+        assert_eq!(source_of(&c(true, "Linus", old)), "davem/net-2.6");
+        let older = "Merge master.kernel.org:/home/rmk/linux-2.6-arm";
+        assert_eq!(source_of(&c(true, "Linus", older)), "rmk/linux-2.6-arm");
+        let (names, per) = sources(&[c(false, "Linus", "Linux-2.6.12-rc2"), c(false, "Ada", "x")]);
+        assert_eq!(names[per[0] as usize], "initial import");
+        assert_eq!(names[per[1] as usize], "Ada");
     }
 
     #[test]
